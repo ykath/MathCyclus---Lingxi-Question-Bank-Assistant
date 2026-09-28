@@ -20,6 +20,7 @@ from contextlib import closing
 from typing import Callable, Iterable
 
 from utils.core_config import BASE_DIR
+from services.question_similarity_service import SIM_MAIN_THRESHOLD, score_question_pair
 
 
 SEMANTIC_INDEX_PATH = os.path.join(BASE_DIR, "utils", "semantic_index.sqlite3")
@@ -29,10 +30,11 @@ SEMANTIC_QUERY_CACHE_TTL = 60.0
 SEMANTIC_QUERY_CACHE_MAX_ENTRIES = 128
 _QUERY_CACHE: OrderedDict[tuple, tuple[float, list[dict]]] = OrderedDict()
 SIMILARITY_WEIGHTS = {
-    "semantic": 0.68,
-    "formula": 0.15,
-    "lexical": 0.09,
-    "knowledge": 0.05,
+    "gaokao_text": 0.45,
+    "semantic": 0.30,
+    "formula": 0.10,
+    "lexical": 0.08,
+    "knowledge": 0.04,
     "question_type": 0.03,
 }
 
@@ -501,12 +503,26 @@ def _metadata_similarity(left: object, right: object) -> float | None:
     return _set_similarity(left_parts, right_parts) or 0.0
 
 
-def combined_similarity_score(reference_row: dict, candidate_row: dict, semantic_score: float) -> dict:
-    """Combine semantic recall with local mathematical-structure signals."""
+def combined_similarity_score(
+    reference_row: dict,
+    candidate_row: dict,
+    semantic_score: float | None,
+) -> dict:
+    """Combine GaokaoWeb text scoring with embedding and local signals."""
     reference_text = _row_similarity_text(reference_row)
     candidate_text = _row_similarity_text(candidate_row)
+    gaokao = score_question_pair(
+        reference_row.get("题干") or "",
+        candidate_row.get("题干") or "",
+        left_choices=reference_row.get("选项"),
+        right_choices=candidate_row.get("选项"),
+        left_question_type_id=reference_row.get("题型ID") or reference_row.get("question_type_id"),
+        right_question_type_id=candidate_row.get("题型ID") or candidate_row.get("question_type_id"),
+        allow_sub=True,
+    )
     components = {
-        "semantic": max(0.0, min(1.0, float(semantic_score))),
+        "gaokao_text": gaokao.get("score"),
+        "semantic": None if semantic_score is None else max(0.0, min(1.0, float(semantic_score))),
         "formula": _set_similarity(_formula_features(reference_text), _formula_features(candidate_text)),
         "lexical": _lexical_similarity(reference_text, candidate_text),
         "knowledge": _metadata_similarity(reference_row.get("知识板块"), candidate_row.get("知识板块")),
@@ -524,6 +540,8 @@ def combined_similarity_score(reference_row: dict, candidate_row: dict, semantic
     ) / (available_weight or 1.0)
 
     reasons = []
+    if gaokao.get("score") is not None and gaokao.get("score", 0) >= 0.6:
+        reasons.append(f"文本结构接近（{gaokao['score']:.0%}）")
     if components["knowledge"] is not None and components["knowledge"] >= 0.8:
         reasons.append("同知识板块")
     if components["question_type"] is not None and components["question_type"] >= 0.8:
@@ -534,9 +552,20 @@ def combined_similarity_score(reference_row: dict, candidate_row: dict, semantic
         reasons.append("题干表述接近")
     if not reasons:
         reasons.append("语义接近")
+    gaokao_score = gaokao.get("score")
+    relationship_kind = None
+    if gaokao.get("kind") == "exact":
+        relationship_kind = "same_question"
+    elif gaokao_score is not None and float(gaokao_score) >= SIM_MAIN_THRESHOLD:
+        relationship_kind = "similar_question"
     return {
         "score": float(max(0.0, min(1.0, score))),
         "semantic_score": components["semantic"],
+        "gaokao_score": gaokao_score,
+        "gaokao_detail": gaokao,
+        "relationship_kind": relationship_kind,
+        "relationship_eligible": relationship_kind is not None,
+        "relationship_score": 1.0 if relationship_kind == "same_question" else gaokao_score,
         "components": components,
         "reason": " · ".join(reasons),
     }
@@ -548,26 +577,20 @@ def search_similar_row(
     model_name: str,
     top_k: int = 200,
 ) -> list[dict]:
-    """Rank indexed rows against an already-indexed reference row."""
+    """Rank rows with embeddings when available and always keep a local fallback."""
     if not rows:
         return []
-    if not model_name.strip():
-        raise SemanticSearchError("请先配置 embedding 模型")
     reference_id = str(reference_row.get("SQLite题目ID") or reference_row.get("题目ID") or "").strip()
     reference_path = _normalized_index_path(reference_row.get("相对文件路径"))
-    if not reference_id and not reference_path:
-        raise SemanticSearchError("基准题缺少可关联的题目 ID 或索引路径")
-    if not os.path.exists(SEMANTIC_INDEX_PATH):
-        raise SemanticSearchError("语义索引尚未建立，请先更新语义索引")
+    if not model_name.strip() or not os.path.exists(SEMANTIC_INDEX_PATH):
+        return _rank_local_similarity(reference_row, rows, reference_id, reference_path, top_k)
 
     with closing(_connect()) as conn:
         indexed_models = [row[0] for row in conn.execute(
             "SELECT DISTINCT model_name FROM semantic_embeddings"
         ).fetchall()]
-        if not indexed_models:
-            raise SemanticSearchError("语义索引为空，请先更新语义索引")
-        if len(indexed_models) != 1 or indexed_models[0] != model_name.strip():
-            raise SemanticSearchError("当前 embedding 模型与索引不一致，请重建索引")
+        if not indexed_models or len(indexed_models) != 1 or indexed_models[0] != model_name.strip():
+            return _rank_local_similarity(reference_row, rows, reference_id, reference_path, top_k)
         stored = conn.execute(
             "SELECT relative_path, question_id, dimensions, vector FROM semantic_embeddings"
         ).fetchall()
@@ -584,11 +607,13 @@ def search_similar_row(
             vectors_by_id[normalized_id] = entry
 
     reference_entry = vectors_by_id.get(reference_id) or vectors_by_path.get(reference_path)
-    if not reference_entry:
-        raise SemanticSearchError("基准题尚未建立向量，请先更新语义索引")
-    reference_dimensions, reference_blob = reference_entry
-    reference_vector = _unpack_vector(reference_blob, reference_dimensions)
-    reference_norm = math.sqrt(sum(value * value for value in reference_vector)) or 1.0
+    reference_dimensions = None
+    reference_vector = None
+    reference_norm = 1.0
+    if reference_entry:
+        reference_dimensions, reference_blob = reference_entry
+        reference_vector = _unpack_vector(reference_blob, reference_dimensions)
+        reference_norm = math.sqrt(sum(value * value for value in reference_vector)) or 1.0
 
     scored = []
     seen_keys = set()
@@ -598,26 +623,63 @@ def search_similar_row(
         if (reference_id and row_id == reference_id) or (reference_path and row_path == reference_path):
             continue
         entry = vectors_by_id.get(row_id) or vectors_by_path.get(row_path)
-        if not entry:
-            continue
-        dimensions, blob = entry
-        if dimensions != reference_dimensions:
-            continue
         unique_key = row_id or row_path
         if unique_key in seen_keys:
             continue
         seen_keys.add(unique_key)
-        vector = _unpack_vector(blob, dimensions)
-        denominator = reference_norm * (math.sqrt(sum(value * value for value in vector)) or 1.0)
-        semantic_score = sum(left * right for left, right in zip(reference_vector, vector)) / denominator
+        semantic_score = None
+        if entry and reference_vector:
+            dimensions, blob = entry
+            if dimensions == reference_dimensions:
+                vector = _unpack_vector(blob, dimensions)
+                denominator = reference_norm * (math.sqrt(sum(value * value for value in vector)) or 1.0)
+                semantic_score = sum(left * right for left, right in zip(reference_vector, vector)) / denominator
         ranking = combined_similarity_score(reference_row, row, semantic_score)
         scored.append({
             "row": row,
             "score": ranking["score"],
             "semantic_score": ranking["semantic_score"],
+            "gaokao_score": ranking.get("gaokao_score"),
+            "gaokao_detail": ranking.get("gaokao_detail"),
+            "relationship_kind": ranking.get("relationship_kind"),
+            "relationship_eligible": ranking.get("relationship_eligible", False),
+            "relationship_score": ranking.get("relationship_score"),
             "components": ranking["components"],
             "reason": ranking["reason"],
             "path": row.get("相对文件路径", ""),
         })
     scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored[: max(1, int(top_k))]
+
+
+def _rank_local_similarity(
+    reference_row: dict,
+    rows: list[dict],
+    reference_id: str,
+    reference_path: str,
+    top_k: int,
+) -> list[dict]:
+    """Use the shared text rule when embedding configuration is unavailable."""
+    scored = []
+    for index, row in enumerate(rows):
+        row_id = str(row.get("SQLite题目ID") or row.get("题目ID") or "").strip()
+        row_path = _normalized_index_path(row.get("相对文件路径"))
+        if (reference_id and row_id == reference_id) or (reference_path and row_path == reference_path):
+            continue
+        ranking = combined_similarity_score(reference_row, row, None)
+        scored.append({
+            "row": row,
+            "score": ranking["score"],
+            "semantic_score": None,
+            "gaokao_score": ranking.get("gaokao_score"),
+            "gaokao_detail": ranking.get("gaokao_detail"),
+            "relationship_kind": ranking.get("relationship_kind"),
+            "relationship_eligible": ranking.get("relationship_eligible", False),
+            "relationship_score": ranking.get("relationship_score"),
+            "components": ranking["components"],
+            "reason": ranking["reason"],
+            "path": row.get("相对文件路径", ""),
+            "_index": index,
+        })
+    scored.sort(key=lambda item: (-item["score"], item.get("_index", 0)))
     return scored[: max(1, int(top_k))]

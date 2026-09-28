@@ -15,7 +15,7 @@ import sys
 import textwrap
 import tempfile
 import mimetypes
-from urllib.parse import quote
+import threading
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
 try:
@@ -47,11 +47,8 @@ from services.semantic_search_service import (
 )
 from services.draft_parse_service import (
     asset_caption_from_source_path as _service_asset_caption_from_source_path,
-    extract_batch_info_from_ocr as _extract_batch_info_from_ocr,
-    extract_choice_items as _service_extract_choice_items,
     extract_choices_from_stem as _service_extract_choices_from_stem,
     extra_dict as _service_extra_dict,
-    fix_problem_format as _service_fix_problem_format,
     increment_question_number as _service_increment_question_number,
     join_number_and_sub_number as _service_join_number_and_sub_number,
     json_list_text as _service_json_list_text,
@@ -59,16 +56,13 @@ from services.draft_parse_service import (
     parse_asset_lines as _service_parse_asset_lines,
     parse_single_ocr_result as _parse_single_ocr_result,
     process_batch_ocr_result as _service_process_batch_ocr_result,
-    read_balanced_argument as _service_read_balanced_argument,
     source_label as _service_source_label,
     split_input_items as _service_split_input_items,
-    split_problem_block_by_choices as _service_split_problem_block_by_choices,
     split_text_list as _service_split_text_list,
     strip_problem_body as _service_strip_problem_body,
 )
 from utils.runtime_files import ensure_log_csv
 from utils.sortable_list import st_sortable_list
-from utils.local_stats import sync_question_activity
 
 def _compat_container(*, key=None, **kwargs):
     return st.container(**kwargs)
@@ -81,6 +75,52 @@ def _question_key(prefix: str, fpath: str) -> str:
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(APP_ROOT, ".env"))
 ensure_log_csv(APP_ROOT)
+
+_CROP_EDITOR_COMPONENT = components.declare_component(
+    "mathcyclus_crop_editor",
+    path=os.path.join(APP_ROOT, "components", "crop_editor"),
+)
+
+_FACTORY_WORKERS: dict[str, threading.Thread] = {}
+_FACTORY_WORKER_RESULTS: dict[str, dict] = {}
+_FACTORY_WORKER_LOCK = threading.Lock()
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _crop_editor_image_data_uri(path: str, file_size: int, file_mtime: float) -> str:
+    target = Path(path)
+    if not target.is_file() or file_size > 12 * 1024 * 1024:
+        return ""
+    mime_type = mimetypes.guess_type(target.name)[0] or "image/png"
+    encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _render_drag_crop_editor(image_path: str | Path, bbox: list | tuple, *, key: str) -> list[int] | None:
+    target = Path(image_path)
+    if not target.is_file():
+        return None
+    try:
+        from services.image_region_service import normalize_region_bbox
+
+        with Image.open(target) as image:
+            width, height = image.size
+        initial_bbox = normalize_region_bbox(bbox, width, height) or [0, 0, width, height]
+        image_data = _crop_editor_image_data_uri(str(target.resolve()), target.stat().st_size, target.stat().st_mtime)
+        if not image_data:
+            return None
+        result = _CROP_EDITOR_COMPONENT(
+            image_data=image_data,
+            bbox=initial_bbox,
+            key=key,
+            default=None,
+        )
+        if isinstance(result, dict):
+            normalized = normalize_region_bbox(result.get("bbox") or [], width, height)
+            return normalized or None
+    except Exception:
+        return None
+    return None
 
 from utils.core_config import *
 from utils.file_ops import *
@@ -245,15 +285,16 @@ def inject_custom_css():
     st.markdown("""
         <style>
         html {
-            scrollbar-gutter: stable;
+            scrollbar-gutter: auto;
         }
         body {
-            overflow-y: scroll;
+            overflow: hidden;
             overflow-x: hidden;
         }
         div[data-testid="stAppViewContainer"] {
-            overflow-y: scroll;
-            scrollbar-gutter: stable;
+            overflow-y: auto;
+            overflow-x: hidden;
+            scrollbar-gutter: auto;
         }
         header[data-testid="stHeader"] {
             background: transparent !important;
@@ -878,6 +919,11 @@ AI_ENV_DEFAULTS = {
     "AI_MODEL_NAME": "qwen-vl-plus",
     "AI_SOLVER_MODEL_NAME": "qwen3.6-flash",
     "AI_EMBEDDING_MODEL_NAME": "",
+    "MINERU_API_TOKEN": "",
+    "MINERU_API_BASE_URL": "https://mineru.net/api/v4",
+    "MINERU_API_TIMEOUT_SECONDS": "30",
+    "MINERU_API_POLL_INTERVAL_SECONDS": "3",
+    "MINERU_API_POLL_TIMEOUT_SECONDS": "900",
     "AI_OCR_PROMPT": (
         "请识别图片中的数学题，并严格按照 LaTeX 格式输出。"
         "如果图片中有多道独立题目，必须逐题输出独立的文件名分隔符和完整 problem、answer、solutions 环境，"
@@ -891,6 +937,11 @@ AI_ENV_WRITE_ORDER = (
     "AI_MODEL_NAME",
     "AI_SOLVER_MODEL_NAME",
     "AI_EMBEDDING_MODEL_NAME",
+    "MINERU_API_TOKEN",
+    "MINERU_API_BASE_URL",
+    "MINERU_API_TIMEOUT_SECONDS",
+    "MINERU_API_POLL_INTERVAL_SECONDS",
+    "MINERU_API_POLL_TIMEOUT_SECONDS",
 )
 
 def _root_env_path() -> str:
@@ -978,12 +1029,23 @@ def _write_ocr_prompt_file(prompt: str):
 
 @st.dialog("API 与\n提示词", width="large")
 def api_settings_dialog():
+    from services.runtime_capability_service import runtime_capabilities
+
     env_path = _root_env_path()
     config = _read_root_ai_env_config()
     ocr_prompt_value, prompt_file_exists = _read_ocr_prompt_for_settings(config)
     editable_prompts = prompt_values()
     env_state = "已读取根目录 .env" if os.path.exists(env_path) else "未找到 .env，保存时会自动创建"
     prompt_state = "已读取根目录 ocr_prompt.txt" if prompt_file_exists else "未找到 ocr_prompt.txt，保存时会自动创建"
+    capability_report = runtime_capabilities()
+    capability_status = {item["name"]: item for item in capability_report.get("capabilities") or []}
+
+    def _setting_int(key: str, fallback: str, minimum: int, maximum: int) -> int:
+        try:
+            value = int(str(config.get(key, fallback)).strip())
+        except (TypeError, ValueError):
+            value = int(fallback)
+        return max(minimum, min(maximum, value))
 
     st.markdown(
         """
@@ -1064,6 +1126,50 @@ def api_settings_dialog():
             placeholder="例如 text-embedding-v4",
             help="留空即可继续使用精确搜索；填写后可在搜索页启用语义检索。",
         )
+        st.markdown("#### 文档解析器配置")
+        st.caption("MinerU 只负责 PDF 版面、文本、公式和图片区域解析；页面级 TeX 识别仍使用上方的 OCR / 图片识别模型。MinerU 配置为空时，自动模式会回退到本地 PyMuPDF。")
+        mineru_token = st.text_input(
+            "MinerU API Token",
+            value=config.get("MINERU_API_TOKEN", ""),
+            type="password",
+            placeholder="可选；留空则不启用 MinerU 云端",
+            help="对应 MINERU_API_TOKEN。只在需要云端解析时填写。",
+        )
+        mineru_base_url = st.text_input(
+            "MinerU API 地址",
+            value=config.get("MINERU_API_BASE_URL", AI_ENV_DEFAULTS["MINERU_API_BASE_URL"]),
+            placeholder="https://mineru.net/api/v4",
+        )
+        mineru_timeout = st.number_input(
+            "MinerU 请求超时（秒）",
+            min_value=5,
+            max_value=600,
+            value=_setting_int("MINERU_API_TIMEOUT_SECONDS", AI_ENV_DEFAULTS["MINERU_API_TIMEOUT_SECONDS"], 5, 600),
+            step=5,
+        )
+        mineru_poll_interval = st.number_input(
+            "MinerU 轮询间隔（秒）",
+            min_value=1,
+            max_value=60,
+            value=_setting_int("MINERU_API_POLL_INTERVAL_SECONDS", AI_ENV_DEFAULTS["MINERU_API_POLL_INTERVAL_SECONDS"], 1, 60),
+            step=1,
+        )
+        mineru_poll_timeout = st.number_input(
+            "MinerU 最大等待时间（秒）",
+            min_value=30,
+            max_value=7200,
+            value=_setting_int("MINERU_API_POLL_TIMEOUT_SECONDS", AI_ENV_DEFAULTS["MINERU_API_POLL_TIMEOUT_SECONDS"], 30, 7200),
+            step=30,
+        )
+        st.markdown("#### 本地解析能力")
+        status_cols = st.columns(3)
+        status_cols[0].metric("PyMuPDF", "可用" if capability_status.get("PyMuPDF", {}).get("available") else "不可用")
+        status_cols[1].metric("OpenCV", "可用" if capability_status.get("OpenCV", {}).get("available") else "未安装")
+        status_cols[2].metric("MinerU 云端", "已配置" if capability_report.get("cloud_configured") else "未配置")
+        st.caption(
+            f"当前自动链路：{capability_report.get('boundary') or ''}；"
+            f"任务目录：{os.path.abspath(os.path.join(APP_ROOT, 'data', 'imports', 'pdf_jobs'))}"
+        )
         st.markdown("#### 提示词配置")
         st.caption("以下提示词会保存到项目根目录的独立文本文件，修改后对应功能下次调用立即生效。")
         tags_prompt = st.text_area("难度与知识标签提示词", value=editable_prompts["tags"], height=180)
@@ -1098,6 +1204,11 @@ def api_settings_dialog():
                 "AI_MODEL_NAME": model_name.strip(),
                 "AI_SOLVER_MODEL_NAME": solver_model.strip(),
                 "AI_EMBEDDING_MODEL_NAME": embedding_model.strip(),
+                "MINERU_API_TOKEN": mineru_token.strip(),
+                "MINERU_API_BASE_URL": mineru_base_url.strip(),
+                "MINERU_API_TIMEOUT_SECONDS": str(int(mineru_timeout)),
+                "MINERU_API_POLL_INTERVAL_SECONDS": str(int(mineru_poll_interval)),
+                "MINERU_API_POLL_TIMEOUT_SECONDS": str(int(mineru_poll_timeout)),
             })
             _write_ocr_prompt_file(ocr_prompt)
             save_prompt("tags", tags_prompt)
@@ -1289,6 +1400,14 @@ def inject_unified_visual_system_css():
         div[data-testid="stAppViewContainer"] > section {
             background: var(--mc-bg) !important;
             color: var(--mc-text) !important;
+        }
+        /* Use one scroll owner so the scrollbar stays flush with the viewport edge. */
+        html { scrollbar-gutter: auto !important; }
+        body { overflow: hidden !important; }
+        div[data-testid="stAppViewContainer"] {
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+            scrollbar-gutter: auto !important;
         }
         .block-container {
             width: calc(100% - 1rem) !important;
@@ -2903,16 +3022,6 @@ def generate_question_png_from_latex(content: str, filename_hint: str = "挖空�
             except Exception:
                 pass
 
-def _replace_first_env_or_insert_after_problem(tex: str, env_name: str, new_block: str) -> str:
-    new_block = (new_block or "").strip()
-    if not new_block:
-        return tex
-    pat = re.compile(rf"\\begin\{{{re.escape(env_name)}\}}[\s\S]*?\\end\{{{re.escape(env_name)}\}}")
-    if pat.search(tex):
-        return pat.sub(lambda m: new_block, tex, count=1)
-    if "\\end{problem}" in tex:
-        return tex.replace("\\end{problem}", "\\end{problem}\n\n" + new_block, 1)
-    return tex.rstrip() + "\n\n" + new_block + "\n"
 
 def _insert_block_after(tex: str, anchor_pat: str, new_block: str) -> str:
     m = re.search(anchor_pat, tex)
@@ -2984,14 +3093,6 @@ def _append_alt_solutions_after_last_solutions(tex: str, new_solutions_block: st
         return _insert_block_after(tex, r"\\end\{problem\}", alt_block)
     return tex.rstrip() + "\n\n" + alt_block + "\n"
 
-def _prepend_line_after_begin(block: str, env_name: str, line: str) -> str:
-    block = (block or "").strip()
-    if not block:
-        return block
-    begin = f"\\begin{{{env_name}}}"
-    if begin not in block:
-        return block
-    return block.replace(begin, begin + "\n" + line, 1)
 
 def _split_answer_solutions_from_text(text: str):
     ans = _extract_env_block(text, "answer")
@@ -3467,18 +3568,6 @@ def _update_csv_index_for_content_change(fpath: str, new_content: str):
     except Exception:
         return
 
-def _save_tex_from_widget(fpath: str, widget_key: str, edit_mode_key: str = "", toast_msg: str = "文件已保存！"):
-    raw = st.session_state.get(widget_key, "")
-    if not _duplicate_save_confirmation(fpath, raw, scope=widget_key):
-        return False
-    final_content = save_modified_tex_file(fpath, raw)
-    _update_csv_index_for_content_change(fpath, final_content)
-    _clear_advanced_search_result_cache()
-    st.session_state[widget_key] = final_content
-    if edit_mode_key:
-        st.session_state[edit_mode_key] = False
-    st.session_state["last_saved"] = time.time()
-    st.toast(toast_msg, icon="✅")
 
 def _apply_generated_answer_solutions_to_file(fpath: str, new_answer: str, new_solutions: str, mode: str, alt_label: str = ""):
     with open(fpath, "r", encoding="utf-8") as f:
@@ -3513,53 +3602,6 @@ def _ai_sol_keys(fpath: str, key_prefix: str):
     editor_key = f"ai_sol_editor_{fhash}"
     return fhash, data_key, editor_key
 
-def render_ai_solution_generate_button(
-    fpath: str,
-    current_content: str,
-    key_prefix: str,
-    use_container_width: bool = True,
-    compact: bool = False,
-    action_columns=None,
-):
-    fhash, data_key, editor_key = _ai_sol_keys(fpath, key_prefix)
-    do = None
-    upload_open_key = f"ai_sol_upload_open_{fhash}"
-
-    if compact:
-        if action_columns:
-            c_ai, c_img = action_columns
-            with c_ai:
-                if st.button("\U0001f916 AI\u751f\u6210\u89e3\u7b54", key=f"ai_sol_gen_{fhash}", type="primary", use_container_width=use_container_width):
-                    do = "ai"
-            with c_img:
-                if st.button("\U0001f5bc\ufe0f \u89e3\u7b54\u56fe\u7247\u8bc6\u522b", key=f"ai_sol_img_toggle_{fhash}", type="secondary", use_container_width=use_container_width):
-                    st.session_state[upload_open_key] = not st.session_state.get(upload_open_key, False)
-        else:
-            if st.button("\U0001f916 AI\u751f\u6210\u89e3\u7b54", key=f"ai_sol_gen_{fhash}", type="primary", use_container_width=use_container_width):
-                do = "ai"
-            if st.button("\U0001f5bc\ufe0f \u89e3\u7b54\u56fe\u7247\u8bc6\u522b", key=f"ai_sol_img_toggle_{fhash}", type="secondary", use_container_width=use_container_width):
-                st.session_state[upload_open_key] = not st.session_state.get(upload_open_key, False)
-    else:
-        c_ai, c_img = st.columns([1, 1])
-        with c_ai:
-            if st.button("🤖 AI生成解答", key=f"ai_sol_gen_{fhash}", type="primary", use_container_width=use_container_width):
-                do = "ai"
-        with c_img:
-            if st.button("🖼️ 解答图片识别", key=f"ai_sol_img_toggle_{fhash}", type="secondary", use_container_width=use_container_width):
-                st.session_state[upload_open_key] = not st.session_state.get(upload_open_key, False)
-
-    if do:
-        problem_tex = _extract_problem_env(current_content)
-        with st.spinner("🤖 AI 正在生成解答..."):
-            res = call_ai_for_answer_solutions(problem_tex, fast=False)
-        if "error" in res:
-            st.toast(res["error"], icon="❌")
-        else:
-            combined = _normalize_ai_generated_tex_for_preview(res["answer_tex"].strip() + "\n\n" + res["solutions_tex"].strip())
-            st.session_state[data_key] = {"answer_tex": res["answer_tex"], "solutions_tex": res["solutions_tex"]}
-            st.session_state[editor_key] = combined
-            st.toast("已生成解答（未写回文件）", icon="🪄")
-            st.rerun()
 
 def render_ai_solution_image_ocr_section(fpath: str, key_prefix: str, max_images: int = 5, compact: bool = False):
     fhash, data_key, editor_key = _ai_sol_keys(fpath, key_prefix)
@@ -3820,17 +3862,11 @@ def normalize_single_problem_structure(text, s_year="?", s_type="?", s_paper="?"
     r"""安全提取并重组单题的 LaTeX 结构，确保 \begin{problem}...\end{problem} 包裹正确，并预留答案和解析。"""
     return _service_normalize_single_problem_structure(text, s_year, s_type, s_paper, s_num, s_subj)
 
-def fix_problem_format(text):
-    """修复 \begin{problem} 的非标准格式，统一转为 {年份}{类别}{试卷}{题号}{板块} 格式"""
-    return _service_fix_problem_format(text)
 
 def _increment_question_number(number: str, offset: int = 1) -> str:
     """Increment numeric question numbers while keeping non-numeric labels editable."""
     return _service_increment_question_number(number, offset)
 
-def _split_problem_block_by_choices(problem_block: str) -> list[str]:
-    """Split an OCR block only when repeated choice environments give clear boundaries."""
-    return _service_split_problem_block_by_choices(problem_block)
 
 def process_batch_ocr_result(ocr_result, mode):
     """Normalize OCR output into one independently editable block per problem."""
@@ -3841,11 +3877,6 @@ def process_batch_ocr_result(ocr_result, mode):
         update_batch_form_from_ocr(parsed.first_info)
     return parsed.normalized_text
 
-def extract_info_to_form(ocr_result):
-    """从单个OCR结果中提取信息并更新到表单"""
-    info = _extract_batch_info_from_ocr(ocr_result)
-    if info:
-        update_batch_form_from_ocr(info)
 
 def update_batch_form_from_ocr(info):
     """更新同卷试题录入表单中的统一信息"""
@@ -3997,40 +4028,13 @@ def _sqlite_draft_collect_edit_form_values(draft_id: str) -> dict:
     return values
 
 
-def _sqlite_draft_preview_question_from_state() -> dict:
-    tags = _sqlite_draft_split_text_list(st.session_state.get("sqlite_draft_tags_text", ""))
-    choices = _db_preview_split_choice_lines(_sqlite_draft_collect_manual_choices_text())
-    difficulty = st.session_state.get("sqlite_draft_difficulty")
-    if difficulty == "未设置":
-        difficulty = None
-    return {
-        "question_id": "DRAFT",
-        "legacy_id": "DRAFT",
-        "detected_year": st.session_state.get("sqlite_draft_year", ""),
-        "paper_series": st.session_state.get("sqlite_draft_paper_series", "G"),
-        "detected_source": st.session_state.get("sqlite_draft_source_name", ""),
-        "detected_question_number": st.session_state.get("sqlite_draft_question_number", ""),
-        "detected_topic": st.session_state.get("sqlite_draft_topic", ""),
-        "stem_tex": st.session_state.get("sqlite_draft_stem_tex", ""),
-        "choices_json": json.dumps(choices, ensure_ascii=False),
-        "answer_tex": st.session_state.get("sqlite_draft_answer_tex", ""),
-        "solution_tex": st.session_state.get("sqlite_draft_solution_tex", ""),
-        "difficulty": difficulty,
-        "tags_json": json.dumps(tags, ensure_ascii=False),
-        "note": st.session_state.get("sqlite_draft_note", ""),
-        "usage_count": 0,
-    }
 
 
 SQLITE_DRAFT_ENTRY_MODES = ["批量试题录入", "同卷试题录入", "同书试题录入"]
 
 
-def _sqlite_draft_read_balanced_argument(text: str, start_brace: int) -> tuple[str | None, int]:
-    return _service_read_balanced_argument(text, start_brace)
 
 
-def _sqlite_draft_extract_choice_items(choices_inner: str) -> list[str]:
-    return _service_extract_choice_items(choices_inner)
 
 
 def _sqlite_draft_extract_choices_from_stem(stem_tex: str) -> tuple[str, list[str]]:
@@ -5167,72 +5171,6 @@ def _sqlite_apply_document_job_to_batch(job_result: dict, entry_mode: str):
             st.session_state[prefix("tags_text")] = "，".join(ai_result["tags"])
 
 
-def _sqlite_auto_refine_document_job(job_result: dict, entry_mode: str) -> dict[str, int]:
-    """Run first-pass document candidates through the per-question vision pipeline."""
-    from services.ai_service import ensure_question_asset_placeholders, recognize_question_structure
-    from services.document_ai_queue_service import (
-        create_or_refresh_queue,
-        finish_queue_item,
-        next_queue_item,
-        set_queue_status,
-    )
-    from services.pdf_import_service import load_pdf_import_job
-
-    load_dotenv(_root_env_path(), override=True)
-    if not all(os.getenv(key, "").strip() for key in ("AI_API_KEY", "AI_BASE_URL", "AI_MODEL_NAME")):
-        return {"succeeded": 0, "failed": 0, "skipped": 0, "unavailable": 1}
-
-    job_id = str(job_result.get("job_id") or "")
-    job_dir = Path(str(job_result.get("job_dir") or ""))
-    jobs_root = job_dir.parent
-    loaded = load_pdf_import_job(job_id, jobs_root=jobs_root)
-    questions = [item for item in loaded["draft_payload"].get("questions") or [] if isinstance(item, dict)]
-    document_job = st.session_state.get("sqlite_draft_batch_document_job") or {}
-    session_questions = document_job.get("questions") or questions
-    queue = create_or_refresh_queue(job_id, jobs_root=jobs_root)
-    set_queue_status(job_id, "running", jobs_root=jobs_root)
-    counts = {"succeeded": 0, "failed": 0, "skipped": 0, "unavailable": 0}
-    progress = st.progress(0.0, text=f"正在精修第 1/{len(questions)} 题...")
-    processed = 0
-    while True:
-        item = next_queue_item(job_id, jobs_root=jobs_root)
-        if not item:
-            break
-        index = int(item.get("index") or 0)
-        if not 0 <= index < len(questions):
-            finish_queue_item(job_id, str(item.get("source_item_id") or ""), error="题目索引越界", jobs_root=jobs_root)
-            counts["failed"] += 1
-            continue
-        question = questions[index]
-        extra = question.get("extra") if isinstance(question.get("extra"), dict) else {}
-        crop_paths = []
-        for raw_path in extra.get("question_crop_paths") or []:
-            crop_path = Path(str(raw_path))
-            if not crop_path.is_absolute():
-                crop_path = job_dir / crop_path
-            if crop_path.is_file():
-                crop_paths.append(str(crop_path.resolve()))
-        progress.progress(processed / max(1, len(questions)), text=f"正在精修第 {index + 1}/{len(questions)} 题...")
-        result = recognize_question_structure(
-            crop_paths,
-            extracted_text=str(extra.get("stem_source_with_image_markers") or question.get("raw_source_text") or question.get("stem_tex") or ""),
-            question_number=str(extra.get("detected_question_number") or index + 1),
-            allowed_topics=SUBJECTS,
-            image_markers=[str(asset.get("alias") or asset.get("caption") or "") for asset in question.get("assets") or []],
-        )
-        source_item_id = str(item.get("source_item_id") or "")
-        if result.get("error"):
-            finish_queue_item(job_id, source_item_id, error=str(result["error"]), jobs_root=jobs_root)
-            counts["failed"] += 1
-        else:
-            result["stem_tex"], _ = ensure_question_asset_placeholders(result.get("stem_tex") or "", question.get("assets") or [])
-            finish_queue_item(job_id, source_item_id, result=result, jobs_root=jobs_root)
-            if index < len(session_questions):
-                _sqlite_apply_ai_result_to_batch_item(index + 1, result)
-            counts["succeeded"] += 1
-        processed += 1
-    progress.progress(1.0, text=f"AI 精修完成：成功 {counts['succeeded']} 题，失败 {counts['failed']} 题")
-    return counts
 
 
 def _sqlite_refine_document_pages(
@@ -5254,6 +5192,7 @@ def _sqlite_refine_document_pages(
 
     loaded = load_pdf_import_job(job_id, jobs_root=jobs_root)
     payload = loaded["draft_payload"]
+    manifest = loaded["manifest"]
     questions = [item for item in payload.get("questions") or [] if isinstance(item, dict)]
     pages = {int(item.get("page_number") or 0): item for item in payload.get("pages") or [] if isinstance(item, dict)}
     queue = create_or_refresh_queue(job_id, jobs_root=jobs_root)
@@ -5299,7 +5238,17 @@ def _sqlite_refine_document_pages(
         page = pages.get(page_number) or {}
         image_path = jobs_root / job_id / str(page.get("image_path") or "")
         numbers = [str((item.get("extra") or {}).get("question_number") or "") for item in page_questions]
-        result = recognize_document_page_tex(image_path, page_number=page_number, question_numbers=numbers)
+        result = {"error": "页面识别尚未执行"}
+        for attempt in range(3):
+            result = recognize_document_page_tex(image_path, page_number=page_number, question_numbers=numbers)
+            if not result.get("error"):
+                break
+            _, retryable = classify_queue_error(str(result.get("error") or ""))
+            if not retryable or attempt >= 2:
+                break
+            # Retry only transient API failures; malformed TeX and mapping
+            # failures should remain visible for targeted human review.
+            time.sleep(1.5 * (attempt + 1))
         counts["pages"] += 1
         update_queue_progress(
             job_id,
@@ -5342,6 +5291,19 @@ def _sqlite_refine_document_pages(
                 "recognizer_version": "page_v1",
             })
             question_extra = question.setdefault("extra", {})
+            question_extra["ai_provenance"] = {
+                "page_number": page_number,
+                "model_name": str(result.get("model_name") or ""),
+                "prompt_file": str(result.get("prompt_file") or "ocr_prompt.txt"),
+                "prompt_sha256": str(result.get("prompt_sha256") or ""),
+                "recognizer_version": str(result.get("recognizer_version") or "page_v1"),
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            }
+            ai_provenance = payload.setdefault("provenance", {}).setdefault("ai", {})
+            if result.get("model_name"):
+                ai_provenance["model_name"] = str(result.get("model_name"))
+            if result.get("prompt_sha256"):
+                ai_provenance.setdefault("prompt", {})["sha256"] = str(result.get("prompt_sha256"))
             if normalized.get("topics"):
                 question_extra["detected_topic"] = "，".join(
                     str(topic).strip()
@@ -5363,6 +5325,9 @@ def _sqlite_refine_document_pages(
     payload["questions"] = questions
     payload["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     write_json(jobs_root / job_id / "draft_payload.json", payload)
+    manifest["provenance"] = payload.get("provenance") or manifest.get("provenance") or {}
+    manifest["updated_at"] = payload["updated_at"]
+    write_json(jobs_root / job_id / "job_manifest.json", manifest)
     return counts
 
 
@@ -5882,9 +5847,9 @@ def _render_sqlite_entry_ai_recognition_panel(entry_mode: str):
                         stamp = datetime.datetime.now().strftime("%H%M%S")
                         _sqlite_draft_append_batch_text(image_result_text, label=f"图片识别-{stamp}")
                 if refine_result.get("unavailable"):
-                    st.warning("AI 配置未完成，已保留本地解析草稿；配置 AI 后可重新执行页面识别。")
+                    st.warning("AI 配置未完成，已保留 PyMuPDF 本地解析草稿；配置 AI 后可重新执行页面识别。")
                 elif refine_result.get("failed"):
-                    st.warning(f"已完成本地解析和页面识别：成功 {refine_result['succeeded']} 题，失败 {refine_result['failed']} 题，可在下方按页重试。")
+                    st.warning(f"已完成 PyMuPDF 本地解析和页面识别：成功 {refine_result['succeeded']} 题，失败 {refine_result['failed']} 题，可在下方按页重试。")
                 else:
                     st.toast(f"已完成 {job_result['question_candidate_count']} 道题的页面解析与识别", icon="✅")
                 st.rerun()
@@ -6011,7 +5976,7 @@ def _render_sqlite_entry_ai_recognition_panel(entry_mode: str):
 
 def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_options, type_name_by_id):
     from services.database_service import DEFAULT_DATABASE_PATH
-    from services.document_parser_service import available_document_parsers
+    from services.runtime_capability_service import runtime_capabilities
     from services.pdf_import_service import (
         DEFAULT_JOBS_ROOT,
         bulk_mark_pdf_candidates_ready,
@@ -6059,7 +6024,7 @@ def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_opt
         )
         parser_choices = ["auto", "cloud", "local"]
         parser_labels = {
-            "auto": "自动：MinerU 云端失败后使用本地",
+            "auto": "自动：云端 MinerU → PyMuPDF",
             "cloud": "仅 MinerU 云端",
             "local": "仅本地 PyMuPDF",
         }
@@ -6068,14 +6033,11 @@ def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_opt
             parser_choices,
             key="sqlite_pdf_import_parser_mode",
             format_func=lambda value: parser_labels[value],
-            help="自动模式会把云端失败、超时或结果不完整统一交给本地 PyMuPDF接力。",
+            help="自动模式优先使用云端 MinerU，云端不可用或失败时回退到本地 PyMuPDF。",
         )
-        parser_status = next(
-            (item for item in available_document_parsers() if item.get("name") == "mineru_cloud"),
-            {},
-        )
-        if parser_mode in {"auto", "cloud"} and not parser_status.get("available"):
-            st.caption("当前未配置 MinerU 云端 Token，自动模式将使用本地 PyMuPDF。")
+        capability_report = runtime_capabilities()
+        if parser_mode in {"auto", "cloud"} and not capability_report.get("cloud_configured"):
+            st.caption("当前未配置 MinerU 云端 Token；自动模式会使用本地 PyMuPDF。")
         create_job = st.button(
             "创建解析任务",
             key="sqlite_pdf_import_create",
@@ -6258,23 +6220,23 @@ def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_opt
             except Exception as exc:
                 st.error(f"批量校验失败：{exc}")
 
-    ready_candidate_ids = [
+    approved_candidate_ids = [
         str(item.get("source_item_id") or "")
         for item in questions
-        if str(item.get("review_status") or "") in {"ready", "approved"}
+        if str(item.get("review_status") or "") == "approved"
     ]
     if st.button(
-        f"录入其余已审核题（{len(ready_candidate_ids)}）",
+        f"录入已二次审核题（{len(approved_candidate_ids)}）",
         key=f"sqlite_pdf_import_commit_ready_{selected_job}",
         type="primary",
         use_container_width=True,
-        disabled=not ready_candidate_ids,
-        help="只提交 ready/approved 候选；缺答案或解析属于提醒，不会阻断入库。",
+        disabled=not approved_candidate_ids,
+        help="只有人工二次审核并标记为 approved 的候选题才允许正式入库；缺答案或解析属于提醒。",
     ):
         try:
             result = commit_pdf_import_candidates(
                 selected_job,
-                ready_candidate_ids,
+                approved_candidate_ids,
                 db_path=DEFAULT_DATABASE_PATH,
                 jobs_root=DEFAULT_JOBS_ROOT,
             )
@@ -6435,7 +6397,7 @@ def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_opt
             "确认录入当前题",
             key=f"sqlite_pdf_import_commit_one_{selected_job}_{selected_question_id}",
             use_container_width=True,
-            disabled=str(candidate.get("review_status") or "") not in {"ready", "approved"},
+            disabled=str(candidate.get("review_status") or "") != "approved",
             help="先保存候选并将审核状态设为 ready，再提交当前题。",
         ):
             try:
@@ -6466,11 +6428,36 @@ def _render_sqlite_pdf_import_workspace(left_col, page_col, editor_col, type_opt
                 if asset_path.is_file():
                     st.image(str(asset_path), caption=f"裁剪预览 · {asset.get('alias') or asset_index + 1}", use_column_width=True)
                 if len(bbox) >= 4:
+                    page_number_value = int(asset.get("page_number") or 1)
+                    source_page = next(
+                        (
+                            item
+                            for item in loaded.get("draft_payload", {}).get("pages", [])
+                            if int(item.get("page_number") or 0) == page_number_value
+                        ),
+                        {},
+                    )
+                    source_page_path = loaded["job_dir"] / str(source_page.get("image_path") or "")
+                    editor_bbox = _render_drag_crop_editor(
+                        source_page_path,
+                        bbox,
+                        key=f"pdf_drag_crop_{selected_job}_{selected_question_id}_{asset_index}",
+                    )
+                    coord_bbox = editor_bbox or bbox
+                    coord_keys = [
+                        f"pdf_crop_{selected_job}_{selected_question_id}_{asset_index}_{name}"
+                        for name in ["左", "上", "右", "下"]
+                    ]
+                    if editor_bbox:
+                        for coord_key, coord_value in zip(coord_keys, editor_bbox):
+                            st.session_state[coord_key] = int(coord_value)
                     crop_cols = st.columns([1, 1, 1, 1, 1.2], gap="small")
                     values = []
-                    for column, name, value in zip(crop_cols[:4], ["左", "上", "右", "下"], bbox[:4]):
+                    for column, name, value, coord_key in zip(crop_cols[:4], ["左", "上", "右", "下"], coord_bbox[:4], coord_keys):
                         with column:
-                            values.append(st.number_input(name, min_value=0, value=int(value), step=1, key=f"pdf_crop_{selected_job}_{selected_question_id}_{asset_index}_{name}"))
+                            if coord_key not in st.session_state:
+                                st.session_state[coord_key] = int(value)
+                            values.append(st.number_input(name, min_value=0, step=1, key=coord_key))
                     with crop_cols[4]:
                         if st.button("重新裁剪", key=f"pdf_recrop_{selected_job}_{selected_question_id}_{asset_index}", use_container_width=True):
                             try:
@@ -6588,7 +6575,7 @@ def _render_sqlite_batch_question_card(
         st.session_state[item_prefix("tex_normalization_version")] = 2
 
     if recognition_status != "ai_succeeded":
-        st.info("本地解析已完成题号和图片裁剪，题干与公式等待 AI 视觉识别。", icon="ℹ️")
+        st.info("PyMuPDF 已完成题号和图片裁剪，题干与公式等待 AI 视觉识别。", icon="ℹ️")
 
     document_job_dir = Path(str((st.session_state.get("sqlite_draft_batch_document_job") or {}).get("job_dir") or ""))
     question_crop_paths = []
@@ -6874,7 +6861,11 @@ def _render_sqlite_batch_question_card(
 
         source_conflicts = find_paper_position_conflict(db_path, current_extra)
         content_matches = find_question_content_matches(
-            db_path, str(current_payload.get("stem_tex") or ""), max_results=3
+            db_path,
+            str(current_payload.get("stem_tex") or ""),
+            choices=current_payload.get("choices"),
+            question_type_id=current_payload.get("question_type_id"),
+            max_results=3,
         )
         if source_conflicts:
             conflict_text = "、".join(str(item.get("question_id") or "") for item in source_conflicts)
@@ -6883,6 +6874,34 @@ def _render_sqlite_batch_question_card(
             st.warning(f"本批内试卷位置冲突：与第 {batch_position_conflict} 题使用相同题号。请修改题号或跳过其中一题。")
         exact_matches = [item for item in content_matches if item.get("kind") == "exact"]
         similar_matches = [item for item in content_matches if item.get("kind") == "similar"]
+        relation_candidates = [*exact_matches, *similar_matches]
+        if relation_candidates:
+            st.markdown("**候选关系（可选）**")
+            st.caption("勾选后会随本题草稿保存；只有本题通过人工二次审核并正式入库后，才会写入题目关系。")
+            selected_relations = []
+            for relation_candidate in relation_candidates:
+                candidate_id = str(relation_candidate.get("question_id") or "").strip()
+                if not candidate_id:
+                    continue
+                relation_type = "same_question" if relation_candidate.get("kind") == "exact" else "similar_question"
+                relation_label = "同题" if relation_type == "same_question" else "相似题"
+                score_label = f"{float(relation_candidate.get('score') or 0):.0%}"
+                if st.checkbox(
+                    f"{candidate_id}（{score_label}，{relation_label}）",
+                    key=item_prefix(f"equivalence_candidate_{candidate_id}"),
+                    help="只建立题目关系，不删除、合并或覆盖已有题目。",
+                ):
+                    selected_relations.append({
+                        "question_id": candidate_id,
+                        "relation_type": relation_type,
+                        "confidence": float(relation_candidate.get("score") or 0),
+                        "note": (
+                            "录入页面人工勾选；"
+                            f"匹配通道：{relation_candidate.get('channel') or '综合推荐'}"
+                        ),
+                    })
+            current_extra["manual_equivalence_candidates"] = selected_relations
+            current_payload["extra"] = current_extra
         if exact_matches:
             links = " ".join(
                 f"<a href='#duplicate-preview-{html.escape(str(item.get('question_id') or ''))}' data-duplicate-preview-id='{html.escape(str(item.get('question_id') or ''))}'>{html.escape(str(item.get('question_id') or '未分配 ID'))}</a>"
@@ -6930,10 +6949,12 @@ def _render_sqlite_batch_question_card(
                             },
                             source_path=f"streamlit/manual-entry/{entry_mode}/single",
                         )
-                        commit_draft_to_question(
-                            db_path, result["draft_id"], operator="streamlit_batch_single_import", require_ready=False
-                        )
-                        st.session_state[decision_key] = "committed"
+                        st.session_state["sqlite_draft_show_review_workspace"] = True
+                        st.session_state["sqlite_draft_selected_id"] = result["draft_id"]
+                        st.session_state["sqlite_draft_review_status_filter"] = "needs_review"
+                        st.session_state["sqlite_draft_review_batch_filter"] = result.get("batch_id") or ""
+                        st.session_state[decision_key] = "pending"
+                        st.toast("本题草稿已生成，请完成二次审核后再确认入库", icon="⚠️")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"单题录入失败：{exc}")
@@ -7184,13 +7205,14 @@ def _commit_sqlite_batch_entry_payloads(
     ]
     if blocked:
         return {"status": "error", "message": f"有 {len(blocked)} 道题存在硬错误，未执行批量录入。"}
-    commit_result = commit_drafts_to_questions(
-        db_path,
-        [str(item.get("draft_id") or "") for item in result.get("results") or []],
-        operator="streamlit_batch_direct_import",
-        require_ready=False,
-    )
-    return commit_result
+    draft_ids = [str(item.get("draft_id") or "") for item in result.get("results") or []]
+    return {
+        "status": "drafts_created",
+        "batch_id": result.get("batch_id") or "",
+        "draft_ids": draft_ids,
+        "draft_count": len(draft_ids),
+        "message": "已生成草稿。请在草稿审核区逐题二次审核并批准后，再确认入库。",
+    }
 
 
 def render_sqlite_manual_draft_entry():
@@ -7840,12 +7862,17 @@ def render_sqlite_manual_draft_entry():
                     )
                     st.error(f"本批暂未录入，发现 {len(blocked)} 道题存在硬错误：{details}")
                 else:
-                    commit_result = commit_drafts_to_questions(
-                        db_path,
-                        [str(item.get("draft_id") or "") for item in result.get("results") or []],
-                        operator="streamlit_batch_direct_import",
-                        require_ready=False,
-                    )
+                    commit_result = {
+                        "status": "drafts_created",
+                        "committed": [],
+                        "results": [],
+                        "message": "已生成草稿，请完成逐题二次审核后再确认入库。",
+                    }
+                    created_draft_ids = [str(item.get("draft_id") or "") for item in result.get("results") or []]
+                    st.session_state["sqlite_draft_show_review_workspace"] = True
+                    st.session_state["sqlite_draft_selected_id"] = created_draft_ids[0] if created_draft_ids else ""
+                    st.session_state["sqlite_draft_review_status_filter"] = "needs_review"
+                    st.session_state["sqlite_draft_review_batch_filter"] = result.get("batch_id") or ""
                     st.session_state["sqlite_draft_last_result"] = {
                         "draft_count": len(result.get("results") or []),
                         "batch_id": result.get("batch_id") or "",
@@ -7854,7 +7881,9 @@ def render_sqlite_manual_draft_entry():
                         "results": commit_result.get("results") or [],
                         "batch_commit": commit_result,
                     }
-                    if commit_result.get("status") == "committed":
+                    if commit_result.get("status") == "drafts_created":
+                        st.success(commit_result.get("message") or "草稿已生成，请完成二次审核。")
+                    elif commit_result.get("status") == "committed":
                         warning_count = len(commit_result.get("warnings") or [])
                         warning_text = f"，有 {warning_count} 题提醒请后续补充" if warning_count else ""
                         st.toast(f"已直接录入 {len(commit_result.get('committed') or [])} 道正式题{warning_text}", icon="✅")
@@ -7928,6 +7957,8 @@ def render_sqlite_manual_draft_entry():
                         matches = find_question_content_matches(
                             db_path,
                             str(payload.get("stem_tex") or ""),
+                            choices=payload.get("choices"),
+                            question_type_id=payload.get("question_type_id"),
                             max_results=3,
                         )
                         kinds = {str(item.get("kind") or "") for item in matches}
@@ -7942,7 +7973,14 @@ def render_sqlite_manual_draft_entry():
                         db_path=db_path,
                         question_to_legacy_tex=question_to_legacy_tex,
                     )
-                    if result.get("status") == "committed":
+                    if result.get("status") == "drafts_created":
+                        st.session_state["sqlite_draft_show_review_workspace"] = True
+                        st.session_state["sqlite_draft_review_status_filter"] = "needs_review"
+                        st.session_state["sqlite_draft_review_batch_filter"] = result.get("batch_id") or ""
+                        st.session_state["sqlite_draft_selected_id"] = (result.get("draft_ids") or [""])[0]
+                        st.success(result.get("message") or "草稿已生成，请完成二次审核。")
+                        st.rerun()
+                    elif result.get("status") == "committed":
                         st.toast(f"已录入 {len(result.get('committed') or [])} 道题", icon="✅")
                         st.rerun()
                     elif result.get("status") == "empty":
@@ -8283,21 +8321,36 @@ def render_sqlite_manual_draft_entry():
                                                 source_page_path = document_job_dir / str(source_page.get("image_path") or "")
                                                 if source_page_path.is_file():
                                                     st.image(str(source_page_path), caption=f"原始第 {page_number_value} 页", use_container_width=True)
+                                                editor_bbox = _render_drag_crop_editor(
+                                                    source_page_path,
+                                                    current_bbox,
+                                                    key=f"sqlite_drag_crop_{document_job_id}_{index}_{asset_index}",
+                                                )
+                                                coord_bbox = editor_bbox or current_bbox
+                                                coord_keys = [
+                                                    f"sqlite_batch_crop_{document_job_id}_{index}_{asset_index}_{coord_name}"
+                                                    for coord_name in ["左", "上", "右", "下"]
+                                                ]
+                                                if editor_bbox:
+                                                    for coord_key, coord_value in zip(coord_keys, editor_bbox):
+                                                        st.session_state[coord_key] = int(coord_value)
                                                 coord_cols = st.columns(4, gap="small")
                                                 coord_values = []
                                                 for coord_col, coord_name, coord_value in zip(
                                                     coord_cols,
                                                     ["左", "上", "右", "下"],
-                                                    current_bbox[:4],
+                                                    coord_bbox[:4],
                                                 ):
                                                     with coord_col:
+                                                        coord_key = coord_keys[["左", "上", "右", "下"].index(coord_name)]
+                                                        if coord_key not in st.session_state:
+                                                            st.session_state[coord_key] = int(coord_value)
                                                         coord_values.append(
                                                             st.number_input(
                                                                 coord_name,
                                                                 min_value=0,
-                                                                value=int(coord_value),
                                                                 step=1,
-                                                                key=f"sqlite_batch_crop_{document_job_id}_{index}_{asset_index}_{coord_name}",
+                                                                key=coord_key,
                                                             )
                                                         )
                                                 if st.button(
@@ -8388,6 +8441,7 @@ def render_sqlite_draft_review_workspace(db_path: str):
         draft_to_preview_question,
         get_draft_question,
         list_import_report_items,
+        list_draft_review_events,
         list_draft_questions,
         list_import_batches,
         update_draft_asset_fields,
@@ -8592,6 +8646,7 @@ def render_sqlite_draft_review_workspace(db_path: str):
     batch_id = "" if batch_filter == "全部批次" else batch_filter
     review_status = "" if status_filter == "全部状态" else status_filter
     report_items = list_import_report_items(db_path, batch_id=batch_id, limit=100)
+    review_events = list_draft_review_events(db_path, batch_id=batch_id, limit=200)
     if report_items:
         with st.expander("批次审核记录", expanded=False):
             st.dataframe(
@@ -8604,6 +8659,24 @@ def render_sqlite_draft_review_workspace(db_path: str):
                         "原因": item.get("reason") or "",
                     }
                     for item in report_items
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+    if review_events:
+        with st.expander(f"二次审核事件（{len(review_events)} 条）", expanded=False):
+            st.dataframe(
+                [
+                    {
+                        "时间": item.get("created_at") or "",
+                        "草稿": item.get("draft_id") or "",
+                        "阶段": item.get("stage") or "",
+                        "状态": f"{item.get('from_status') or ''} → {item.get('to_status') or ''}",
+                        "决定": item.get("decision") or "",
+                        "审核人": item.get("operator") or "",
+                        "说明": item.get("reason") or "",
+                    }
+                    for item in review_events
                 ],
                 hide_index=True,
                 use_container_width=True,
@@ -8936,7 +9009,7 @@ def render_sqlite_draft_review_workspace(db_path: str):
                 "<div class='mc-sqlite-review-danger'>该操作会写入正式 SQLite 题目表、关系表和修订记录；不会修改旧 .tex 文件。</div>",
                 unsafe_allow_html=True,
             )
-            ready_for_commit = status in {"ready", "approved"}
+            ready_for_commit = status == "approved"
             confirm_key = f"sqlite_draft_commit_confirm_{_question_key('draft_commit_confirm', selected_draft_id)}"
             text_key = f"sqlite_draft_commit_text_{_question_key('draft_commit_text', selected_draft_id)}"
             st.checkbox("我确认写入正式题库", key=confirm_key, disabled=not ready_for_commit)
@@ -12646,6 +12719,72 @@ def _db_preview_scroll_to_question(question_id: str):
     st.session_state["db_browse_scroll_target_question_id"] = ""
 
 
+def _db_preview_jump_to_source_question(question_id: str, position: int, page_size: int):
+    """Move the paginated SQLite preview to a question in the selected paper."""
+    try:
+        normalized_position = max(0, int(position))
+        normalized_page_size = max(1, int(page_size))
+    except (TypeError, ValueError):
+        normalized_position = 0
+        normalized_page_size = 10
+    target_page = normalized_position // normalized_page_size + 1
+    st.session_state["db_browse_page"] = target_page
+    st.session_state["db_browse_page_select"] = target_page
+    st.session_state["db_browse_question_choice"] = "__all__"
+    st.session_state["db_browse_focus_question_id"] = ""
+    st.session_state["db_browse_scroll_target_question_id"] = str(question_id or "")
+
+
+def _db_preview_question_number_sort_key(value: object) -> tuple[int, int, str]:
+    """Sort ordinary question numbers before compound sub-question labels."""
+    text = str(value or "").strip()
+    match = re.match(r"^(\d+)(?:\s*\((\d+)\))?", text)
+    if not match:
+        return (10**9, 10**9, text)
+    return (int(match.group(1)), int(match.group(2) or 0), text)
+
+
+def _db_preview_source_navigation_items(db_path: str, filters, selected_source: str, selected_year: str, selected_paper_series: str, selected_chapter: str, selected_type: object, selected_difficulty: str, keyword: str):
+    """Return a paper's question navigation only for an unambiguous full-paper scope."""
+    from services.question_db_service import QuestionListFilters, list_questions_page
+
+    if selected_source == "全部来源" or keyword or selected_chapter != "全部板块":
+        return [], ""
+    if selected_type != "__all__" or selected_difficulty != "全部难度":
+        return [], ""
+    if selected_year == "全部年份" and selected_paper_series == "全部卷别":
+        # The same source name may legally occur in more than one year.
+        # Require an explicit year unless the source itself is unambiguous.
+        year_filter = None
+    else:
+        year_filter = None if selected_year == "全部年份" else int(selected_year)
+    nav_filters = QuestionListFilters(
+        year=year_filter,
+        source=selected_source,
+        paper_series="" if selected_paper_series == "全部卷别" else selected_paper_series,
+        limit=100,
+        offset=0,
+    )
+    try:
+        rows = list(list_questions_page(db_path, nav_filters).get("items") or [])
+    except Exception:
+        return [], ""
+    if not rows:
+        return [], ""
+    distinct_years = {str(item.get("detected_year") or "") for item in rows if item.get("detected_year") not in (None, "")}
+    if selected_year == "全部年份" and len(distinct_years) > 1:
+        return [], "请先选择年份后查看该卷题号"
+    entries = []
+    for position, item in enumerate(rows):
+        question_id = str(item.get("question_id") or "").strip()
+        question_number = str(item.get("detected_question_number") or "").strip()
+        if not question_id or not question_number:
+            continue
+        entries.append({"question_id": question_id, "question_number": question_number, "position": position})
+    entries.sort(key=lambda item: _db_preview_question_number_sort_key(item["question_number"]))
+    return entries, ""
+
+
 def _db_preview_form_token(form_values: dict) -> str:
     encoded = json.dumps(form_values, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:14]
@@ -13422,6 +13561,119 @@ def _db_preview_source_relation_counts(db_path: str, question_id: str) -> dict[s
     return counts
 
 
+def _db_preview_equivalence_relation_counts(db_path: str, question_id: str) -> dict[str, int]:
+    """Return relation counts without making the question preview depend on them."""
+    counts = {"approved": 0, "pending": 0, "ignored": 0}
+    try:
+        from services.equivalence_service import list_question_equivalence_relations
+
+        for relation in list_question_equivalence_relations(db_path, question_id):
+            status = str(relation.get("review_status") or "pending")
+            counts[status] = counts.get(status, 0) + 1
+    except Exception:
+        pass
+    return counts
+
+
+def _db_preview_render_equivalence_relation_management(
+    db_path: str,
+    question_id: str,
+    *,
+    outer_label: str | None = "相似题关系管理",
+    expanded: bool = False,
+):
+    """Show and review equivalence links without merging or deleting questions."""
+    from services.equivalence_service import (
+        list_equivalence_events,
+        list_question_equivalence_relations,
+        update_equivalence_relation,
+    )
+
+    type_labels = {"same_question": "同题", "similar_question": "高度相似", "variant": "变式题"}
+    status_labels = {"approved": "已确认", "pending": "待复核", "ignored": "已撤销"}
+    source_labels = {
+        "manual": "人工维护",
+        "similarity_review": "相似题复核",
+        "draft_import": "草稿审核",
+        "historical_migration": "历史迁移",
+        "api": "本地 API",
+    }
+    shell = st.expander(outer_label, expanded=expanded) if outer_label else st.container()
+    with shell:
+        relations = list_question_equivalence_relations(db_path, question_id)
+        counts = {"approved": 0, "pending": 0, "ignored": 0}
+        for relation in relations:
+            status = str(relation.get("review_status") or "pending")
+            counts[status] = counts.get(status, 0) + 1
+        st.caption(
+            f"已确认 {counts['approved']} · 待复核 {counts['pending']} · 已撤销 {counts['ignored']}。"
+            "撤销只改变关系状态，不删除题目。"
+        )
+        if not relations:
+            st.info("当前题目还没有同题或相似题关系。")
+            return
+        for relation in relations:
+            relation_id = str(relation.get("equivalence_id") or "")
+            counterpart_id = str(relation.get("counterpart_question_id") or "")
+            relation_key = _question_key("equivalence", f"{question_id}:{relation_id}")
+            st.markdown(
+                f"**{html.escape(counterpart_id or '未知题目')}** · "
+                f"{html.escape(type_labels.get(relation.get('relation_type'), str(relation.get('relation_type') or '未分类')))} · "
+                f"{html.escape(status_labels.get(relation.get('review_status'), str(relation.get('review_status') or '未知')))}"
+                f" · {html.escape(source_labels.get(relation.get('relation_source'), str(relation.get('relation_source') or '未知来源')))}",
+                unsafe_allow_html=True,
+            )
+            status_key = _db_preview_edit_field_key(question_id, f"equivalence_status_{relation_key}")
+            type_key = _db_preview_edit_field_key(question_id, f"equivalence_type_{relation_key}")
+            note_key = _db_preview_edit_field_key(question_id, f"equivalence_note_{relation_key}")
+            if status_key not in st.session_state:
+                st.session_state[status_key] = relation.get("review_status") or "pending"
+            if type_key not in st.session_state:
+                st.session_state[type_key] = relation.get("relation_type") or "similar_question"
+            if note_key not in st.session_state:
+                st.session_state[note_key] = relation.get("note") or ""
+            edit_col, action_col = st.columns([2.4, 0.8], gap="small", vertical_alignment="bottom")
+            with edit_col:
+                status_col, type_col = st.columns(2, gap="small")
+                with status_col:
+                    st.selectbox("状态", list(status_labels), format_func=lambda value: status_labels.get(value, value), key=status_key)
+                with type_col:
+                    st.selectbox("关系类型", list(type_labels), format_func=lambda value: type_labels.get(value, value), key=type_key)
+                st.text_input("备注", key=note_key)
+            with action_col:
+                if st.button("保存关系", key=f"save_equivalence_{relation_key}", use_container_width=True):
+                    try:
+                        update_equivalence_relation(
+                            db_path,
+                            relation_id,
+                            review_status=st.session_state.get(status_key),
+                            relation_type=st.session_state.get(type_key),
+                            note=st.session_state.get(note_key, ""),
+                            operator="streamlit_ui",
+                        )
+                        _db_preview_clear_question_payload_cache()
+                        st.toast("题目关系已保存", icon="✅")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"保存题目关系失败：{exc}")
+                if st.button("查看记录", key=f"events_equivalence_{relation_key}", use_container_width=True):
+                    event_key = f"show_equivalence_events_{relation_key}"
+                    st.session_state[event_key] = not st.session_state.get(event_key, False)
+            event_key = f"show_equivalence_events_{relation_key}"
+            if st.session_state.get(event_key):
+                events = list_equivalence_events(db_path, relation_id, limit=10)
+                if events:
+                    for event in events:
+                        st.caption(
+                            f"{event.get('created_at') or ''} · {event.get('action') or ''} · "
+                            f"{status_labels.get(event.get('after_status'), event.get('after_status') or '')} · "
+                            f"{event.get('operator') or '未记录操作人'}"
+                        )
+                else:
+                    st.caption("暂无关系审核记录。")
+            st.divider()
+
+
 def _db_preview_render_source_relation_management(
     db_path: str,
     question_id: str,
@@ -13431,8 +13683,8 @@ def _db_preview_render_source_relation_management(
     expanded: bool = False,
 ):
     from services.export_service import list_source_export_options
-    from services.book_service import list_book_sections, list_question_book_links
-    from services.paper_service import list_question_paper_links
+    from services.book_service import list_book_questions, list_book_sections, list_question_book_links
+    from services.paper_service import list_paper_questions, list_question_paper_links
     from services.source_relation_service import (
         delete_question_book_link,
         delete_question_paper_link,
@@ -13441,7 +13693,7 @@ def _db_preview_render_source_relation_management(
         upsert_question_paper_link,
         upsert_question_topic_link,
     )
-    from services.topic_service import list_question_topic_links, list_topic_groups
+    from services.topic_service import list_question_topic_links, list_topic_groups, list_topic_questions
 
     def source_options(kind: str, id_key: str) -> tuple[list[str], dict[str, str], dict[str, dict]]:
         try:
@@ -13479,6 +13731,23 @@ def _db_preview_render_source_relation_management(
     def set_relation_state(field: str, value):
         st.session_state[_db_preview_source_relation_key(question_id, field)] = value
 
+    def render_reverse_questions(label: str, rows: list[dict], *, key: str, number_field: str) -> None:
+        """Expose the reverse direction of a source relation without leaving the question card."""
+        with st.expander(f"查看此来源下的 {len(rows)} 道题", expanded=False):
+            if not rows:
+                st.caption(f"{label}下暂时没有其他关联题目。")
+                return
+            for row in rows[:200]:
+                other_id = str(row.get("question_id") or "未知 ID")
+                number = str(row.get(number_field) or row.get("display_order") or "?")
+                preview = re.sub(r"\s+", " ", str(row.get("stem_preview") or "")).strip()
+                preview = preview[:90] + ("…" if len(preview) > 90 else "")
+                st.markdown(
+                    f"<div class='mc-db-relation-reverse-row'><strong>{html.escape(other_id)}</strong> · "
+                    f"第 {html.escape(number)} 题 · {html.escape(preview or '题干暂缺')}</div>",
+                    unsafe_allow_html=True,
+                )
+
     source_shell = st.expander(outer_label, expanded=expanded) if outer_label else st.container()
     with source_shell:
         st.caption("只维护 SQLite 来源关系表并记录 revision；不会修改旧 TeX 文件。")
@@ -13495,6 +13764,20 @@ def _db_preview_render_source_relation_management(
                 font-size: 0.86rem;
                 line-height: 1.3;
                 font-weight: 600;
+            }
+            .mc-db-relation-reverse-row {
+                margin: 0.16rem 0;
+                padding: 0.28rem 0.42rem;
+                border-radius: 7px;
+                background: #f8fafc;
+                color: #64748b;
+                font-size: 0.76rem;
+                line-height: 1.35;
+                overflow-wrap: anywhere;
+            }
+            .mc-db-relation-reverse-row strong {
+                color: #4c1d95;
+                font-weight: 780;
             }
             </style>
             """,
@@ -13520,6 +13803,11 @@ def _db_preview_render_source_relation_management(
                 row_col, action_col = st.columns([2.35, 0.65], gap="small")
                 with row_col:
                     st.caption(label)
+                    try:
+                        reverse_rows = list_paper_questions(db_path, str(link.get("paper_id") or ""))
+                        render_reverse_questions("该试卷", reverse_rows, key=link_id, number_field="question_number")
+                    except Exception as exc:
+                        st.caption(f"反向查看试卷题目失败：{exc}")
                 with action_col:
                     if st.button("移除", key=_db_preview_source_relation_key(question_id, f"delete_paper_{link_id}"), use_container_width=True):
                         try:
@@ -13616,6 +13904,11 @@ def _db_preview_render_source_relation_management(
                 row_col, action_col = st.columns([2.35, 0.65], gap="small")
                 with row_col:
                     st.caption(label)
+                    try:
+                        reverse_rows = list_book_questions(db_path, str(link.get("book_id") or ""), limit=200)
+                        render_reverse_questions("该教材", reverse_rows, key=link_id, number_field="exercise_number")
+                    except Exception as exc:
+                        st.caption(f"反向查看教材题目失败：{exc}")
                 with action_col:
                     if link_id and st.button("移除", key=_db_preview_source_relation_key(question_id, f"delete_book_{link_id}"), use_container_width=True):
                         try:
@@ -13758,6 +14051,11 @@ def _db_preview_render_source_relation_management(
                 row_col, action_col = st.columns([2.35, 0.65], gap="small")
                 with row_col:
                     st.caption(label)
+                    try:
+                        reverse_rows = list_topic_questions(db_path, str(link.get("topic_id") or ""), limit=200)
+                        render_reverse_questions("该专题", reverse_rows, key=link_id, number_field="group_name")
+                    except Exception as exc:
+                        st.caption(f"反向查看专题题目失败：{exc}")
                 with action_col:
                     if link_id and st.button("移除", key=_db_preview_source_relation_key(question_id, f"delete_topic_{link_id}"), use_container_width=True):
                         try:
@@ -14140,6 +14438,8 @@ def _db_preview_render_question_edit_workspace(db_path: str, question_id: str, q
             st.caption(f"图片资源计数读取失败：{exc}")
         relation_counts = _db_preview_source_relation_counts(db_path, question_id)
         relation_total = sum(relation_counts.values())
+        equivalence_counts = _db_preview_equivalence_relation_counts(db_path, question_id)
+        equivalence_total = sum(equivalence_counts.values())
         with st.popover(f"图片资源 · {len(preview_assets)}", use_container_width=True):
             _db_preview_render_asset_management(db_path, question_id)
         with st.popover(f"来源关系 · {relation_total}", use_container_width=True):
@@ -14150,6 +14450,12 @@ def _db_preview_render_question_edit_workspace(db_path: str, question_id: str, q
                 db_path,
                 question_id,
                 question,
+                outer_label=None,
+            )
+        with st.popover(f"题目关系 · {equivalence_total}", use_container_width=True):
+            _db_preview_render_equivalence_relation_management(
+                db_path,
+                question_id,
                 outer_label=None,
             )
         try:
@@ -14443,8 +14749,31 @@ def _db_preview_material_drawer_html(bundle: dict) -> str:
 
     traceback = build_question_traceback(bundle, project_root=APP_ROOT)
     assets = traceback.get("assets") or []
+    equivalence_rows = []
+    question_id = str((bundle.get("question") or {}).get("question_id") or "")
+    if question_id:
+        try:
+            from services.database_service import DEFAULT_DATABASE_PATH
+            from services.equivalence_service import list_question_equivalence_relations
+
+            type_labels = {"same_question": "同题", "similar_question": "高度相似", "variant": "变式题"}
+            status_labels = {"approved": "已确认", "pending": "待复核", "ignored": "已撤销"}
+            source_labels = {
+                "manual": "人工维护", "similarity_review": "相似题复核", "draft_import": "草稿审核",
+                "historical_migration": "历史迁移", "api": "本地 API",
+            }
+            for row in list_question_equivalence_relations(DEFAULT_DATABASE_PATH, question_id):
+                equivalence_rows.append(
+                    f"{row.get('counterpart_question_id') or '未知题目'} · "
+                    f"{type_labels.get(row.get('relation_type'), row.get('relation_type') or '未分类')} · "
+                    f"{status_labels.get(row.get('review_status'), row.get('review_status') or '未知')} · "
+                    f"{source_labels.get(row.get('relation_source'), row.get('relation_source') or '未知来源')}"
+                )
+        except Exception:
+            equivalence_rows = []
 
     sections = [list_section("来源回溯", traceback.get("source_rows") or [])]
+    sections.append(list_section("同题 / 相似题关系", equivalence_rows))
     if assets:
         sections.append(
             "<section class='mc-db-material-section'>"
@@ -14467,6 +14796,14 @@ def _db_preview_material_drawer_html(bundle: dict) -> str:
         </details>
     </div>
     """
+
+
+@st.cache_data(show_spinner=False, ttl=20, max_entries=96)
+def _db_preview_filter_options_cached(db_path: str, db_mtime: float, filters=None):
+    """Cache read-only filter options until the SQLite file changes."""
+    from services.question_db_service import list_question_filter_options
+
+    return list_question_filter_options(db_path, filters)
 
 
 def render_sqlite_readonly_browse_preview(
@@ -14493,21 +14830,25 @@ def render_sqlite_readonly_browse_preview(
     st.markdown("""
     <style>
     div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"] .mc-db-browse-left-anchor) {
-        align-items: flex-start !important;
-        gap: 1rem !important;
+        display: grid !important;
+        grid-template-columns: clamp(18rem, 22vw, 21rem) minmax(0, 1fr) !important;
+        column-gap: 0 !important;
+        align-items: start !important;
     }
+
+
     div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"] .mc-db-browse-left-anchor) > div {
         min-width: 0 !important;
         box-sizing: border-box !important;
+        width: auto !important;
+        max-width: none !important;
+        flex: none !important;
     }
     div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"] .mc-db-browse-left-anchor) > div:first-child {
         min-width: 0 !important;
-        flex: 0 0 clamp(18rem, 22vw, 21rem) !important;
-        max-width: clamp(18rem, 22vw, 21rem) !important;
     }
     div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"] .mc-db-browse-left-anchor) > div:last-child {
         min-width: 0 !important;
-        flex: 1 1 0% !important;
     }
     div[data-testid="column"]:has(> div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"] .mc-db-browse-left-anchor) {
         position: sticky !important;
@@ -15193,7 +15534,7 @@ def render_sqlite_readonly_browse_preview(
         font-weight: 680;
     }
     .mc-db-sidebar-section-label {
-        margin: 1.18rem 0 0.38rem;
+        margin: 1.55rem 0 0.62rem;
         color: #1f2328;
         font-size: 1.18rem;
         line-height: 1.25;
@@ -15203,7 +15544,12 @@ def render_sqlite_readonly_browse_preview(
         color: #6b7280;
         font-size: 0.84rem;
         line-height: 1.45;
-        margin: -0.08rem 0 0.62rem;
+        margin: -0.02rem 0 0.92rem;
+    }
+    .mc-db-sidebar-section-break {
+        height: 1.28rem;
+        flex: 0 0 1.28rem;
+        width: 100%;
     }
     .mc-db-search-state {
         display: flex;
@@ -15253,6 +15599,68 @@ def render_sqlite_readonly_browse_preview(
         color: #6b7280;
         font-size: 0.82rem;
         line-height: 1.35;
+    }
+    .mc-db-paper-nav-title {
+        margin: 0.72rem 0 0.2rem;
+        color: #1f2328;
+        font-size: 0.92rem;
+        line-height: 1.25;
+        font-weight: 800;
+    }
+    /* Keep the browse filters breathable; the paper number grid remains compact. */
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] .mc-db-browse-left-anchor) {
+        gap: 0.86rem !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] .mc-db-browse-left-anchor) .mc-db-sidebar-section-label {
+        margin-top: 1.86rem !important;
+        margin-bottom: 0.76rem !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] .mc-db-browse-left-anchor) .mc-db-sidebar-caption {
+        margin-bottom: 1.06rem !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] .mc-db-browse-left-anchor) .mc-db-sidebar-section-label:first-of-type {
+        margin-top: 0.45rem !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(.mc-db-paper-nav-anchor) div[data-testid="stHorizontalBlock"] {
+        gap: 0.28rem !important;
+        margin: 0.12rem 0 !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(.mc-db-paper-nav-anchor) div[data-testid="stButton"] > button {
+        min-height: 1.92rem !important;
+        height: 1.92rem !important;
+        padding: 0.12rem 0.18rem !important;
+        border: 1px solid rgba(109, 40, 217, 0.2) !important;
+        border-radius: 999px !important;
+        background: #ffffff !important;
+        color: #4c1d95 !important;
+        font-size: 0.78rem !important;
+        font-weight: 760 !important;
+        line-height: 1 !important;
+    }
+    div[data-testid="stVerticalBlock"]:has(.mc-db-paper-nav-anchor) div[data-testid="stButton"] > button:hover {
+        border-color: #8b5cf6 !important;
+        background: #f5f3ff !important;
+        color: #5b21b6 !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(.mc-db-code-preview-anchor) {
+        display: grid !important;
+        grid-template-columns: minmax(0, 0.94fr) minmax(0, 1.32fr) !important;
+        column-gap: 0 !important;
+        align-items: start !important;
+    }
+    div[data-testid="stHorizontalBlock"]:has(.mc-db-code-preview-anchor) > div[data-testid="column"] {
+        width: auto !important;
+        max-width: none !important;
+        min-width: 0 !important;
+        flex: none !important;
+    }
+    body:has(.mc-db-browse-anchor) div[data-testid="stHorizontalBlock"]:has(.mc-db-browse-left-anchor) > div:last-child {
+        margin-left: 1.4rem !important;
+        width: calc(100% - 1.4rem) !important;
+    }
+    body:has(.mc-db-browse-anchor) div[data-testid="stHorizontalBlock"]:has(.mc-db-code-preview-anchor) > div:last-child {
+        margin-left: 1.4rem !important;
+        width: calc(100% - 1.4rem) !important;
     }
     .mc-db-question-list-title {
         margin: 1rem 0 0.42rem;
@@ -15336,6 +15744,8 @@ def render_sqlite_readonly_browse_preview(
         st.caption("请先运行数据库重建与提升流程，再使用 SQLite 只读预览。")
         return
 
+    db_mtime = os.path.getmtime(db_path)
+
     for state_key, fallback in [
         ("db_browse_editing_question_id", ""),
         ("db_browse_page", 1),
@@ -15383,7 +15793,7 @@ def render_sqlite_readonly_browse_preview(
         return
 
     try:
-        base_options = list_question_filter_options(db_path)
+        base_options = _db_preview_filter_options_cached(db_path, db_mtime)
     except Exception as exc:
         st.error(f"读取 SQLite 筛选项失败：{exc}")
         return
@@ -15446,7 +15856,7 @@ def render_sqlite_readonly_browse_preview(
         limit=1,
     )
     try:
-        source_context_options = list_question_filter_options(db_path, range_context)
+        source_context_options = _db_preview_filter_options_cached(db_path, db_mtime, range_context)
     except Exception as exc:
         st.warning(f"读取来源联动筛选失败：{exc}")
         source_context_options = {"sources": []}
@@ -15463,7 +15873,7 @@ def render_sqlite_readonly_browse_preview(
         limit=1,
     )
     try:
-        type_context_options = list_question_filter_options(db_path, type_context)
+        type_context_options = _db_preview_filter_options_cached(db_path, db_mtime, type_context)
     except Exception as exc:
         st.warning(f"读取题型联动筛选失败：{exc}")
         type_context_options = {"question_types": []}
@@ -15488,7 +15898,7 @@ def render_sqlite_readonly_browse_preview(
         limit=1,
     )
     try:
-        difficulty_context_options = list_question_filter_options(db_path, difficulty_context)
+        difficulty_context_options = _db_preview_filter_options_cached(db_path, db_mtime, difficulty_context)
     except Exception as exc:
         st.warning(f"读取难度联动筛选失败：{exc}")
         difficulty_context_options = {"difficulties": []}
@@ -15535,6 +15945,7 @@ def render_sqlite_readonly_browse_preview(
             on_click=_db_preview_apply_search,
         )
 
+        st.markdown('<div class="mc-db-sidebar-section-break" aria-hidden="true"></div>', unsafe_allow_html=True)
         st.markdown('<div class="mc-db-sidebar-section-label">范围筛选</div>', unsafe_allow_html=True)
         source_kind_col, paper_series_col = st.columns(2, gap="small")
         with source_kind_col:
@@ -15569,6 +15980,7 @@ def render_sqlite_readonly_browse_preview(
                 on_change=_db_preview_reset_page,
             )
 
+        st.markdown('<div class="mc-db-sidebar-section-break" aria-hidden="true"></div>', unsafe_allow_html=True)
         st.markdown('<div class="mc-db-sidebar-section-label">更多筛选</div>', unsafe_allow_html=True)
         st.markdown('<div class="mc-db-sidebar-caption">试卷来源、题型和难度会按当前知识板块与年份自动收窄。</div>', unsafe_allow_html=True)
         selected_source = st.selectbox("试卷来源", source_options, key="db_browse_source", on_change=_db_preview_reset_page)
@@ -15605,6 +16017,18 @@ def render_sqlite_readonly_browse_preview(
         st.error(f"读取 SQLite 题目失败：{exc}")
         return
 
+    source_navigation_items, source_navigation_hint = _db_preview_source_navigation_items(
+        db_path,
+        filters,
+        selected_source,
+        selected_year,
+        selected_paper_series,
+        selected_chapter,
+        selected_type,
+        selected_difficulty,
+        keyword,
+    )
+
     if page["page_count"] and st.session_state["db_browse_page"] > page["page_count"]:
         st.session_state["db_browse_page"] = page["page_count"]
         st.session_state["db_browse_page_select"] = page["page_count"]
@@ -15626,7 +16050,6 @@ def render_sqlite_readonly_browse_preview(
         focus_question_id = ""
         st.session_state["db_browse_focus_question_id"] = ""
 
-    db_mtime = os.path.getmtime(db_path)
     page_exam_paths = []
     if allow_exam_basket and page_items:
         for item in page_items:
@@ -15654,6 +16077,26 @@ def render_sqlite_readonly_browse_preview(
             f"<div class='mc-db-result-caption'>每页 {page['limit']} 道 · 当前第 {current_page if page_count else 0} / {page_count} 页</div>",
             unsafe_allow_html=True,
         )
+        if source_navigation_items or source_navigation_hint:
+            st.markdown('<span class="mc-db-paper-nav-anchor"></span>', unsafe_allow_html=True)
+            st.markdown('<div class="mc-db-paper-nav-title">本卷题号</div>', unsafe_allow_html=True)
+            if source_navigation_hint:
+                st.caption(source_navigation_hint)
+            else:
+                st.caption(f"已定位 {len(source_navigation_items)} 题；点击题号跳到对应题目")
+                for row_start in range(0, len(source_navigation_items), 6):
+                    row_items = source_navigation_items[row_start:row_start + 6]
+                    nav_cols = st.columns(6, gap="small")
+                    for nav_col, nav_item in zip(nav_cols, row_items):
+                        with nav_col:
+                            st.button(
+                                nav_item["question_number"],
+                                key=f"db_browse_paper_nav_{_db_preview_edit_hash(nav_item['question_id'])}",
+                                use_container_width=True,
+                                on_click=_db_preview_jump_to_source_question,
+                                args=(nav_item["question_id"], nav_item["position"], int(page["limit"] or 10)),
+                                help=f"跳转到第 {nav_item['question_number']} 题",
+                            )
         page_size_col, page_select_col = st.columns([0.92, 1.08], gap="small")
         with page_size_col:
             st.selectbox(
@@ -15875,6 +16318,7 @@ def render_sqlite_readonly_browse_preview(
 
                     code_col, preview_col = st.columns([0.94, 1.32], gap="large")
                     with code_col:
+                        st.markdown('<span class="mc-db-code-preview-anchor"></span>', unsafe_allow_html=True)
                         st.markdown("**TeX 源码**")
                         if allow_edit:
                             st.markdown('<span class="mc-db-code-action-anchor"></span>', unsafe_allow_html=True)
@@ -17226,6 +17670,9 @@ def page_exam_paper_generation():
         st.session_state["_count_widget"] = selected_count
         st.toast("当前新增问题数已超过预设定数，已为您新增题数上限", icon="⚠️")
     render_exam_floating_basket()
+    # Keep the familiar non-blocking search and page-top controls available
+    # while choosing questions in the exam service as well.
+    render_advanced_search_floating_panel()
     from services.database_service import DEFAULT_DATABASE_PATH
     from services.local_preferences_service import QUESTION_SOURCE_LEGACY, QUESTION_SOURCE_SQLITE, get_browse_default_source, source_label
     from services.question_db_service import get_question_bank_availability
@@ -18192,31 +18639,8 @@ def _legacy_migration_abs_path(path: str) -> str:
     return os.path.abspath(os.path.join(BASE_DIR, cleaned))
 
 
-def _legacy_migration_existing_preview_dbs() -> list:
-    data_dir = os.path.join(BASE_DIR, "data")
-    if not os.path.isdir(data_dir):
-        return []
-
-    previews = []
-    for name in os.listdir(data_dir):
-        if not (name.startswith("mathcyclus_preview") and name.endswith(".sqlite3")):
-            continue
-        full_path = os.path.join(data_dir, name)
-        if os.path.isfile(full_path):
-            previews.append(full_path)
-    previews.sort(key=lambda item: os.path.getmtime(item), reverse=True)
-    return previews
 
 
-def _legacy_migration_read_report(path: str, limit: int = 12000) -> str:
-    abs_path = _legacy_migration_abs_path(path)
-    if not abs_path or not os.path.exists(abs_path):
-        return ""
-    with open(abs_path, "r", encoding="utf-8", errors="replace") as report_file:
-        content = report_file.read(limit + 1)
-    if len(content) > limit:
-        return content[:limit] + "\n\n……报告较长，已截断预览。请打开完整报告查看。"
-    return content
 
 
 def _legacy_migration_run_command(command: list, timeout: int = 600) -> dict:
@@ -19255,13 +19679,28 @@ def render_similar_questions_page():
         except Exception as exc:
             return fallback_row.get("题干") or "题干暂缺", {}, str(exc)
 
-    def _render_similarity_result_card(match: dict) -> None:
+    def _render_similarity_result_card(match: dict, reference_id: str) -> None:
         row = match["row"]
         question_id = row.get("SQLite题目ID") or row.get("题目ID") or "未知 ID"
         score = max(0.0, min(1.0, float(match.get("score") or 0))) * 100
         source = " · ".join(filter(None, [row.get("年份"), row.get("试卷名称"), row.get("原卷题号")]))
         taxonomy = " · ".join(filter(None, [row.get("知识板块"), row.get("题型")]))
         with st.container(border=True):
+            relationship_kind = match.get("relationship_kind")
+            if relationship_kind == "same_question":
+                relation_label = "同题关系"
+            elif relationship_kind == "similar_question":
+                relation_label = "高度相似题关系"
+            else:
+                relation_label = "仅供参考"
+            if match.get("relationship_eligible"):
+                st.checkbox(
+                    f"勾选为{relation_label}",
+                    key=f"similarity_relation_select_{reference_id}_{question_id}",
+                    help="只登记题目关系，不删除、合并或改写任何题目。",
+                )
+            else:
+                st.caption("语义推荐：仅供人工参考，不直接登记同题/相似题关系。")
             st.markdown(
                 "<div class='similarity-result-header'>"
                 f"<span class='similarity-score'>{score:.1f}% 综合相关</span>"
@@ -19272,7 +19711,10 @@ def render_similar_questions_page():
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<div class='similarity-match-reason'>匹配依据：{html.escape(match.get('reason') or '语义接近')}</div>",
+                f"<div class='similarity-match-reason'>"
+                f"匹配通道：{html.escape(str((match.get('gaokao_detail') or {}).get('channel') or '综合推荐'))}"
+                f" · 匹配依据：{html.escape(match.get('reason') or '语义接近')}"
+                f"</div>",
                 unsafe_allow_html=True,
             )
             problem_tex, detail_row, preview_error = _load_problem_preview(question_id, row)
@@ -19423,7 +19865,60 @@ def render_similar_questions_page():
             result_columns = st.columns(2, gap="medium")
             for result_column, match in zip(result_columns, page_matches[row_start:row_start + 2]):
                 with result_column:
-                    _render_similarity_result_card(match)
+                    _render_similarity_result_card(match, selected_reference_id)
+
+        selected_matches = [
+            match
+            for match in matches
+            if st.session_state.get(
+                f"similarity_relation_select_{selected_reference_id}_"
+                f"{match.get('row', {}).get('SQLite题目ID') or match.get('row', {}).get('题目ID') or '未知 ID'}",
+                False,
+            )
+        ]
+        if selected_matches:
+            st.markdown("#### 保存人工确认的题目关系")
+            st.caption(f"已勾选 {len(selected_matches)} 道候选。保存后只登记关系，不会自动合并题目。")
+            if st.button(
+                "保存勾选的相似题关系",
+                type="primary",
+                use_container_width=True,
+                key=f"save_similarity_relations_{selected_reference_id}",
+            ):
+                from services.equivalence_service import upsert_manual_equivalence
+
+                saved = []
+                errors = []
+                for match in selected_matches:
+                    row = match.get("row") or {}
+                    candidate_id = str(row.get("SQLite题目ID") or row.get("题目ID") or "").strip()
+                    detail = match.get("gaokao_detail") or {}
+                    try:
+                        relationship_kind = match.get("relationship_kind")
+                        if relationship_kind not in {"same_question", "similar_question"}:
+                            continue
+                        saved.append(
+                            upsert_manual_equivalence(
+                                db_path,
+                                selected_reference_id,
+                                candidate_id,
+                                relation_type=relationship_kind,
+                                confidence=float(match.get("relationship_score") or 0),
+                                relation_source="similarity_review",
+                                operator="streamlit_ui",
+                                note=(
+                                    "相似题查找页人工确认；"
+                                    f"匹配通道：{detail.get('channel') or '综合推荐'}；"
+                                    f"综合依据：{match.get('reason') or '本地相似度计算'}"
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        errors.append(f"{candidate_id or '未知题目'}：{exc}")
+                if saved:
+                    st.success(f"已保存 {len(saved)} 条题目关系。")
+                if errors:
+                    st.error("；".join(errors))
 
 def render_sqlite_batch_maintenance_tool():
     from services.database_service import DEFAULT_DATABASE_PATH
@@ -19534,38 +20029,85 @@ def render_sqlite_batch_maintenance_tool():
 def render_asset_audit_tool():
     from services.database_service import DEFAULT_DATABASE_PATH
     from services.asset_service import audit_asset_library
+    from services.question_quality_service import audit_question_bank
 
     st.markdown("### 🖼️ 图片资源管理")
     st.caption("检查题目图片登记、文件存在性、TeX 占位符引用和本地资源目录中的孤立文件；本页面只读，不会自动删除文件。")
-    if st.button("扫描图片资源", type="primary", use_container_width=True, key="btn_asset_audit"):
+    scan_col, quality_col, limit_col = st.columns([1, 1, 0.8], gap="small", vertical_alignment="bottom")
+    with scan_col:
+        scan_assets = st.button("扫描图片资源", type="primary", use_container_width=True, key="btn_asset_audit")
+    with quality_col:
+        scan_quality = st.button("检查题目质量", use_container_width=True, key="btn_question_quality_audit")
+    with limit_col:
+        quality_limit = st.number_input("本次检查题数", min_value=10, max_value=1000, value=100, step=10, key="question_quality_limit")
+    if scan_assets:
         with st.spinner("正在检查图片资源…"):
             try:
                 st.session_state["asset_audit_report"] = audit_asset_library(DEFAULT_DATABASE_PATH, project_root=APP_ROOT)
             except Exception as exc:
                 st.error(f"图片资源检查失败：{exc}")
+    if scan_quality:
+        with st.spinner(f"正在检查前 {int(quality_limit)} 道题目…"):
+            try:
+                st.session_state["question_quality_report"] = audit_question_bank(
+                    DEFAULT_DATABASE_PATH,
+                    limit=int(quality_limit),
+                )
+            except Exception as exc:
+                st.error(f"题目质量检查失败：{exc}")
     report = st.session_state.get("asset_audit_report")
-    if not report:
-        st.info("点击“扫描图片资源”开始检查。")
-        return
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("已登记资源", report.get("registered", 0))
-    metric_cols[1].metric("可正常读取", report.get("valid", 0))
-    metric_cols[2].metric("缺失文件", len(report.get("missing", [])))
-    metric_cols[3].metric("孤立文件", len(report.get("orphan_files", [])))
-    missing = report.get("missing", [])
-    orphan_files = report.get("orphan_files", [])
-    reference_issues = report.get("reference_issues", [])
-    if missing:
-        st.markdown("#### 缺失或无法读取的登记资源")
-        st.dataframe(missing, use_container_width=True, hide_index=True)
-    if reference_issues:
-        st.markdown("#### TeX 引用与登记关系异常")
-        st.dataframe([{"题目ID": item["question_id"], "问题": item["issues"]} for item in reference_issues], use_container_width=True, hide_index=True)
-    if orphan_files:
-        st.markdown("#### 资源目录中的孤立文件")
-        st.dataframe([{"文件": item} for item in orphan_files[:200]], use_container_width=True, hide_index=True)
-    if not missing and not orphan_files and not reference_issues:
-        st.success("图片资源登记、文件路径和 TeX 引用均未发现问题。")
+    if report:
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("已登记资源", report.get("registered", 0))
+        metric_cols[1].metric("可正常读取", report.get("valid", 0))
+        metric_cols[2].metric("缺失文件", len(report.get("missing", [])))
+        metric_cols[3].metric("孤立文件", len(report.get("orphan_files", [])))
+        missing = report.get("missing", [])
+        orphan_files = report.get("orphan_files", [])
+        reference_issues = report.get("reference_issues", [])
+        if missing:
+            st.markdown("#### 缺失或无法读取的登记资源")
+            st.dataframe(missing, use_container_width=True, hide_index=True)
+        if reference_issues:
+            st.markdown("#### TeX 引用与登记关系异常")
+            st.dataframe([{"题目ID": item["question_id"], "问题": item["issues"]} for item in reference_issues], use_container_width=True, hide_index=True)
+        if orphan_files:
+            st.markdown("#### 资源目录中的孤立文件")
+            st.dataframe([{"文件": item} for item in orphan_files[:200]], use_container_width=True, hide_index=True)
+        if not missing and not orphan_files and not reference_issues:
+            st.success("图片资源登记、文件路径和 TeX 引用均未发现问题。")
+
+    quality_report = st.session_state.get("question_quality_report")
+    if quality_report:
+        counts = quality_report.get("counts") or {}
+        st.markdown("#### 题目质量报告")
+        quality_metrics = st.columns(4)
+        quality_metrics[0].metric("本次检查", quality_report.get("audited", 0))
+        quality_metrics[1].metric("阻断问题", counts.get("blocker", 0))
+        quality_metrics[2].metric("待优化提醒", counts.get("warning", 0))
+        quality_metrics[3].metric("无问题", counts.get("ok", 0))
+        quality_rows = [
+            {
+                "题目ID": row.get("question_id"),
+                "状态": row.get("status"),
+                "题型": row.get("type"),
+                "来源": row.get("source") or "未登记",
+                "问题": "；".join((row.get("errors") or []) + (row.get("warnings") or [])),
+            }
+            for row in quality_report.get("rows") or []
+            if row.get("status") != "ok"
+        ]
+        if quality_rows:
+            st.dataframe(quality_rows, use_container_width=True, hide_index=True)
+            st.download_button(
+                "下载质量报告 JSON",
+                data=json.dumps(quality_report, ensure_ascii=False, indent=2),
+                file_name="question_quality_report.json",
+                mime="application/json",
+                key="download_question_quality_report",
+            )
+        else:
+            st.success("本次检查范围内没有发现题目质量问题。")
 def render_semantic_index_maintenance_tool():
     st.markdown("### 🧠 语义搜索索引")
     st.caption("维护题干 embedding 索引，供混合搜索和语义搜索使用；索引属于可重建的派生数据，不会修改题目内容。")
@@ -19693,6 +20235,546 @@ def render_semantic_index_maintenance_tool():
             st.error(f"语义索引更新失败：{exc}")
 
 
+def _factory_worker_is_running(job_id: str) -> bool:
+    with _FACTORY_WORKER_LOCK:
+        worker = _FACTORY_WORKERS.get(str(job_id or ""))
+        return bool(worker and worker.is_alive())
+
+
+def _factory_start_ai_worker(job_id: str, only_source_item_ids: set[str] | None = None) -> bool:
+    """Run the existing page-level AI queue outside the Streamlit request."""
+    from services.pdf_import_service import DEFAULT_JOBS_ROOT
+
+    safe_job_id = str(job_id or "").strip()
+    if not safe_job_id or _factory_worker_is_running(safe_job_id):
+        return False
+    jobs_root = Path(DEFAULT_JOBS_ROOT)
+
+    def run_worker():
+        try:
+            result = _sqlite_refine_document_pages(
+                safe_job_id,
+                jobs_root,
+                only_source_item_ids=only_source_item_ids,
+            )
+            _FACTORY_WORKER_RESULTS[safe_job_id] = {"status": "completed", **result}
+        except Exception as exc:
+            _FACTORY_WORKER_RESULTS[safe_job_id] = {"status": "failed", "error": str(exc)}
+            try:
+                from services.document_ai_queue_service import set_queue_status
+
+                set_queue_status(safe_job_id, "paused", jobs_root=jobs_root)
+            except Exception:
+                pass
+        finally:
+            with _FACTORY_WORKER_LOCK:
+                _FACTORY_WORKERS.pop(safe_job_id, None)
+
+    worker = threading.Thread(
+        target=run_worker,
+        name=f"mathcyclus-ai-{safe_job_id[:24]}",
+        daemon=True,
+    )
+    with _FACTORY_WORKER_LOCK:
+        _FACTORY_WORKERS[safe_job_id] = worker
+    worker.start()
+    return True
+
+
+def render_ai_data_factory_tool():
+    """Unified entry for PDF assets, page AI recognition and draft review."""
+    from services.document_ai_queue_service import (
+        create_or_refresh_queue,
+        load_queue,
+        queue_summary,
+        retry_failed_items,
+        set_queue_status,
+    )
+    from services.pdf_import_service import (
+        DEFAULT_JOBS_ROOT,
+        create_pdf_import_job,
+        list_pdf_import_jobs,
+        load_pdf_import_job,
+    )
+    from services.database_service import DEFAULT_DATABASE_PATH
+
+    st.markdown("### 🏭 AI 题目数据工厂")
+    st.caption("把 PDF、页面级 AI、图片资源和人工二次审核放进同一条可追踪流水线。任务只生成 QuestionDraft，不会绕过审核直接写入正式题库。")
+    st.markdown(
+        """
+        <style>
+        .mc-factory-flow { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin:12px 0 20px; }
+        .mc-factory-step { min-height:70px; padding:11px 12px; border:1px solid rgba(109,40,217,.15); border-radius:10px; background:#fbfaff; }
+        .mc-factory-step strong { display:block; color:#2f2552; font-size:13px; }
+        .mc-factory-step span { display:block; color:#6b6680; font-size:12px; line-height:1.45; margin-top:4px; }
+        .mc-factory-banner { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:14px 16px; border:1px solid rgba(109,40,217,.16); border-radius:10px; background:linear-gradient(90deg,#fbfaff,#f5f7ff); margin:4px 0 16px; }
+        .mc-factory-banner strong { color:#2f2552; font-size:15px; }
+        .mc-factory-banner span { color:#68627b; font-size:12px; line-height:1.5; }
+        .mc-factory-status { padding:10px 12px; border-radius:8px; border:1px solid rgba(0,122,255,.16); background:#f6faff; color:#445166; font-size:12px; line-height:1.55; margin:8px 0 12px; }
+        .mc-factory-error { padding:10px 12px; border-radius:8px; border:1px solid rgba(220,38,38,.18); background:#fff7f7; color:#8b3030; font-size:12px; line-height:1.5; margin:8px 0; }
+        .mc-factory-job-meta { color:#6b6680; font-size:12px; line-height:1.55; margin:3px 0 10px; }
+        @media (max-width: 900px) { .mc-factory-flow { grid-template-columns:1fr 1fr; } .mc-factory-banner { align-items:flex-start; flex-direction:column; } }
+        </style>
+        <div class="mc-factory-banner">
+          <div><strong>一套任务，两种入口</strong><br><span>项目内上传大 PDF，或由 GPT / JS API 送入草稿；最终都在这里完成页面进度、查重和人工审核。</span></div>
+          <span>正式题库写入：人工批准后</span>
+        </div>
+        <div class="mc-factory-flow">
+          <div class="mc-factory-step"><strong>1 · Asset</strong><span>保存原始 PDF 与 SHA-256</span></div>
+          <div class="mc-factory-step"><strong>2 · Job</strong><span>记录解析任务与进度</span></div>
+          <div class="mc-factory-step"><strong>3 · Pipeline</strong><span>云端 MinerU、PyMuPDF、页面 AI</span></div>
+          <div class="mc-factory-step"><strong>4 · Draft</strong><span>生成逐题草稿和图片引用</span></div>
+          <div class="mc-factory-step"><strong>5 · Review</strong><span>人工审核后才进入正式库</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_new, tab_jobs, tab_api, tab_notes = st.tabs(["新建任务", "任务中心", "API 接力", "流程说明"])
+    with tab_new:
+        source_mode = st.radio(
+            "资源方式",
+            ["浏览器上传", "本机 PDF 路径"],
+            horizontal=True,
+            key="factory_source_mode",
+            help="大文件建议选择本机 PDF 路径，直接由运行题库的电脑读取，不经过浏览器上传。",
+        )
+        left_col, right_col = st.columns([1.25, 1], gap="large")
+        with left_col:
+            uploaded_pdf = None
+            local_pdf_path = ""
+            if source_mode == "浏览器上传":
+                uploaded_pdf = st.file_uploader(
+                    "上传 PDF 资源",
+                    type=["pdf"],
+                    key="factory_pdf_upload",
+                    help="适合较小文件；上传后先生成本地任务，再按页面调用 AI，不会直接写入正式题库。",
+                )
+            else:
+                local_pdf_path = st.text_input(
+                    "本机 PDF 路径",
+                    key="factory_local_pdf_path",
+                    placeholder=r"例如：D:\资料\2025全国I卷.pdf",
+                    help="路径必须存在于运行题库程序的这台电脑上；如果浏览器连接的是远程电脑，请填写远程电脑上的路径。",
+                )
+                if local_pdf_path.strip():
+                    local_candidate = Path(local_pdf_path.strip()).expanduser()
+                    if local_candidate.is_file() and local_candidate.suffix.lower() == ".pdf":
+                        st.caption(f"已找到本地文件：{local_candidate.stat().st_size / 1024 / 1024:.1f} MB")
+                    else:
+                        st.warning("本机路径不存在，或文件不是 PDF。")
+            source_type = st.selectbox(
+                "来源类型",
+                ["pdf_paper", "pdf_book", "pdf_topic", "pdf_misc"],
+                format_func=lambda value: {
+                    "pdf_paper": "试卷",
+                    "pdf_book": "教材",
+                    "pdf_topic": "专题",
+                    "pdf_misc": "未标记来源 / 其他",
+                }.get(value, value),
+                key="factory_source_type",
+            )
+            source_name = st.text_input("来源名称", key="factory_source_name", placeholder="例如：2025 全国 I 卷")
+            source_year = st.text_input("年份 / 册次", key="factory_source_year", placeholder="可选")
+        with right_col:
+            parser_mode = st.selectbox(
+                "版面解析器",
+                ["auto", "cloud", "local"],
+                format_func=lambda value: {
+                    "auto": "自动接力：云端 MinerU → PyMuPDF",
+                    "cloud": "优先 MinerU 云端",
+                    "local": "仅本地 PyMuPDF",
+                }.get(value, value),
+                key="factory_parser_mode",
+            )
+            ai_mode = st.selectbox(
+                "题目识别策略",
+                ["page_gpt", "mineru_draft", "manual_review"],
+                format_func=lambda value: {
+                    "page_gpt": "页面 AI 识别并生成标准 TeX（推荐）",
+                    "mineru_draft": "只生成版面草稿，暂不调用 AI",
+                    "manual_review": "只做裁剪和切题，人工填写 TeX",
+                }.get(value, value),
+                key="factory_ai_mode",
+            )
+            render_dpi = st.select_slider(
+                "页面清晰度",
+                options=[120, 144, 180, 216],
+                value=180,
+                format_func=lambda value: f"{value} DPI",
+                key="factory_render_dpi",
+            )
+            st.markdown(
+                '<div class="mc-factory-status"><strong>任务边界</strong><br>先保存原 PDF、页面图片和识别结果，再生成逐题草稿。中途可以暂停，失败页可以重试；正式入库仍需人工二次审核。</div>',
+                unsafe_allow_html=True,
+            )
+
+        local_candidate = Path(local_pdf_path.strip()).expanduser() if local_pdf_path.strip() else None
+        can_create = (
+            uploaded_pdf is not None
+            if source_mode == "浏览器上传"
+            else bool(local_candidate and local_candidate.is_file() and local_candidate.suffix.lower() == ".pdf")
+        )
+        if st.button("🚀 创建解析 Job", key="factory_create_job", type="primary", use_container_width=True, disabled=not can_create):
+            temporary_path = ""
+            try:
+                if source_mode == "本机 PDF 路径":
+                    source_pdf_path = str(local_candidate.resolve())
+                    upload_filename = local_candidate.name
+                else:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temporary_file:
+                        uploaded_pdf.seek(0)
+                        shutil.copyfileobj(uploaded_pdf, temporary_file, length=4 * 1024 * 1024)
+                        temporary_path = temporary_file.name
+                    source_pdf_path = temporary_path
+                    upload_filename = uploaded_pdf.name
+                metadata = {
+                    key: value
+                    for key, value in {
+                        "source_name": source_name.strip(),
+                        "year_or_volume": source_year.strip(),
+                        "upload_filename": upload_filename,
+                    }.items()
+                    if value
+                }
+                with st.spinner("正在创建 Asset、解析页面并生成题目草稿…"):
+                    result = create_pdf_import_job(
+                        source_pdf_path,
+                        jobs_root=DEFAULT_JOBS_ROOT,
+                        source_type=source_type,
+                        source_metadata=metadata,
+                        render_dpi=render_dpi,
+                        original_name=uploaded_pdf.name,
+                        parser_mode=parser_mode,
+                        pipeline_code="math_exam_hybrid",
+                        ai_mode=ai_mode,
+                    )
+                st.session_state["factory_selected_job"] = result["job_id"]
+                create_or_refresh_queue(result["job_id"], jobs_root=DEFAULT_JOBS_ROOT)
+                st.success(
+                    f"Job 已创建：{result['page_count']} 页，生成 {result['question_candidate_count']} 个草稿候选。"
+                )
+            except Exception as exc:
+                st.error(f"创建 Job 失败：{exc}")
+            finally:
+                if temporary_path and os.path.exists(temporary_path):
+                    try:
+                        os.unlink(temporary_path)
+                    except OSError:
+                        pass
+
+    jobs = list_pdf_import_jobs(DEFAULT_JOBS_ROOT)
+    jobs_by_id = {str(item.get("job_id")): item for item in jobs}
+    selected_job = str(st.session_state.get("factory_selected_job") or "")
+    if selected_job not in jobs_by_id and jobs:
+        selected_job = str(jobs[0].get("job_id") or "")
+        st.session_state["factory_selected_job"] = selected_job
+
+    with tab_jobs:
+        if not jobs_by_id:
+            st.info("还没有 PDF Job。请先在“新建任务”上传一份 PDF。")
+        else:
+            selected_job = st.selectbox(
+                "选择 Job",
+                list(jobs_by_id),
+                key="factory_selected_job",
+                format_func=lambda value: (
+                    f"{jobs_by_id[value].get('original_name') or value} · "
+                    f"{jobs_by_id[value].get('question_candidate_count') or 0} 题 · "
+                    f"{jobs_by_id[value].get('status') or '未知'}"
+                ),
+            )
+            loaded = load_pdf_import_job(selected_job, jobs_root=DEFAULT_JOBS_ROOT)
+            manifest = loaded.get("manifest") or {}
+            source = manifest.get("source") or {}
+            pipeline = manifest.get("pipeline") or {}
+            queue = load_queue(selected_job, jobs_root=DEFAULT_JOBS_ROOT) or create_or_refresh_queue(selected_job, jobs_root=DEFAULT_JOBS_ROOT)
+            summary = queue_summary(queue)
+            metric_cols = st.columns(5)
+            metric_cols[0].metric("Asset", str(source.get("asset_id") or "未设置")[-14:])
+            metric_cols[1].metric("页面", str((manifest.get("document") or {}).get("page_count") or 0))
+            metric_cols[2].metric("题目草稿", str(len(loaded.get("draft_payload", {}).get("questions") or [])))
+            metric_cols[3].metric("AI 已处理", f"{summary['finished']}/{summary['total']}")
+            elapsed_seconds = int(float(queue.get("elapsed_seconds") or 0))
+            metric_cols[4].metric("已用时", f"{elapsed_seconds // 60:02d}:{elapsed_seconds % 60:02d}")
+            st.caption(
+                f"解析器：{manifest.get('parser', {}).get('name') or '未知'} · "
+                f"Pipeline：{pipeline.get('code') or '未设置'} · "
+                f"AI：{pipeline.get('ai_mode') or '未设置'}"
+            )
+            current_page = int(queue.get("current_page") or 0)
+            total_pages = int(queue.get("total_pages") or 0)
+            if summary["total"]:
+                st.progress(
+                    summary["finished"] / max(1, summary["total"]),
+                    text=f"页面级 AI 队列：{summary['status']} · 页面 {current_page}/{total_pages or '—'} · 成功 {summary['succeeded']} · 失败 {summary['failed']}",
+                )
+            question_by_id = {
+                str(item.get("source_item_id") or ""): item
+                for item in loaded.get("draft_payload", {}).get("questions") or []
+                if isinstance(item, dict)
+            }
+            worker_running = _factory_worker_is_running(selected_job)
+            action_col, pause_col, retry_col, review_col, refresh_col = st.columns(5, gap="small")
+            with action_col:
+                if st.button(
+                    "继续页面 AI" if not worker_running else "AI 处理中…",
+                    key=f"factory_start_ai_{selected_job}",
+                    use_container_width=True,
+                    disabled=worker_running or summary["status"] == "completed" or pipeline.get("ai_mode") != "page_gpt",
+                ):
+                    _factory_start_ai_worker(selected_job)
+                    st.rerun()
+            if pipeline.get("ai_mode") != "page_gpt":
+                st.caption("当前任务选择了不调用页面 AI 的策略，因此不需要启动页面 AI 队列。")
+            with pause_col:
+                if st.button(
+                    "暂停",
+                    key=f"factory_pause_ai_{selected_job}",
+                    use_container_width=True,
+                    disabled=not worker_running,
+                ):
+                    set_queue_status(selected_job, "paused", jobs_root=DEFAULT_JOBS_ROOT)
+                    st.toast("已请求暂停，当前页面完成后停止。", icon="⏸️")
+                    st.rerun()
+            with retry_col:
+                if st.button(
+                    "重试失败页",
+                    key=f"factory_retry_ai_{selected_job}",
+                    use_container_width=True,
+                    disabled=not summary["failed"] or worker_running,
+                ):
+                    retry_failed_items(selected_job, jobs_root=DEFAULT_JOBS_ROOT)
+                    _factory_start_ai_worker(selected_job)
+                    st.rerun()
+            with review_col:
+                if st.button("打开草稿审核", key=f"factory_open_review_{selected_job}", type="primary", use_container_width=True):
+                    st.session_state["sqlite_draft_entry_mode"] = "PDF 导入草稿"
+                    st.session_state["sqlite_pdf_import_selected_job"] = selected_job
+                    st.session_state["main_nav_selection"] = "✍️\n录入问题"
+                    st.rerun()
+            with refresh_col:
+                if st.button("刷新状态", key=f"factory_refresh_{selected_job}", use_container_width=True):
+                    st.rerun()
+            if worker_running:
+                st.caption("页面 AI 正在后台处理；点击“刷新状态”查看最新页码、用时和失败项。")
+            worker_result = _FACTORY_WORKER_RESULTS.get(selected_job) or {}
+            if worker_result.get("status") == "failed":
+                st.markdown(f'<div class="mc-factory-error">页面 AI 任务异常：{html.escape(str(worker_result.get("error") or "未知错误"))}</div>', unsafe_allow_html=True)
+            failed_items = [item for item in queue.get("items") or [] if item.get("status") == "failed"]
+            if failed_items:
+                with st.expander(f"失败项（{len(failed_items)}）", expanded=True):
+                    st.caption("失败通常来自某一页返回不完整、模型超时或题号无法映射。可只重试其中一题，系统会按它所在页重新识别。")
+                    for failed_item in failed_items:
+                        source_item_id = str(failed_item.get("source_item_id") or "")
+                        question = question_by_id.get(source_item_id) or {}
+                        extra = question.get("extra") if isinstance(question.get("extra"), dict) else {}
+                        item_col, action_col = st.columns([4, 1], gap="small", vertical_alignment="center")
+                        with item_col:
+                            st.markdown(
+                                f"**第 {html.escape(str(failed_item.get('question_number') or '—'))} 题** · "
+                                f"第 {html.escape(str(extra.get('page_start') or '—'))} 页 · "
+                                f"{html.escape(str(failed_item.get('error') or '未记录错误'))}"
+                            )
+                        with action_col:
+                            if st.button("重试此项", key=f"factory_retry_one_{selected_job}_{source_item_id}", use_container_width=True, disabled=worker_running):
+                                _factory_start_ai_worker(selected_job, {source_item_id})
+                                st.rerun()
+            with st.expander("查看 Asset、Pipeline 与来源追踪", expanded=False):
+                st.json(
+                    {
+                        "asset": source,
+                        "pipeline": pipeline,
+                        "job_id": selected_job,
+                        "job_directory": str(loaded.get("job_dir") or ""),
+                    }
+                )
+
+    with tab_api:
+        st.markdown("#### API 接力录题")
+        st.caption("API 生成的草稿与 PDF Job 使用同一套 QuestionDraft 审核闸门。")
+        if st.button("进入 API 状态与客户端面板", key="factory_open_api", use_container_width=True):
+            st.session_state["tools_subpage"] = "local_api"
+            st.rerun()
+        st.code("GPT / 浏览器 JS → 本地 API → QuestionDraft → 查重与来源匹配 → 人工审核 → 正式题库", language="text")
+        st.markdown(
+            '<div class="mc-factory-status"><strong>推荐分工</strong><br>大 PDF 用本页创建 Job，页面级 AI 负责批量识别；少量补录或 GPT 客户端识别结果走本地 API。两边都只能生成草稿，不能自动批准。</div>',
+            unsafe_allow_html=True,
+        )
+
+    with tab_notes:
+        st.markdown(
+            """
+            **推荐默认流程**
+
+            1. 云端 MinerU 或本地 PyMuPDF 负责页面、文本、公式区域和图片裁剪。
+            2. 页面级 AI 负责把整页题目转换为标准 TeX，不逐题重复调用。
+            3. 本地队列保存每页结果，失败页可以单独重试。
+            4. 每道题进入 QuestionDraft 后，再进行查重、来源匹配和人工二次审核。
+            5. 只有人工批准且内容 hash 未变化的草稿才能进入正式题库。
+
+            当前页面已经支持大 PDF 的 Job、Asset 标识、本机路径读取、页面级队列、暂停、恢复和失败重试；
+            后续再增加真正的分片上传和跨电脑 API 资源上传。
+            """
+        )
+
+
+def render_local_api_tool():
+    """Show the local draft API status and safe browser-client entry point."""
+    def _clear_local_api_token():
+        st.session_state.pop("local_api_token", None)
+
+    st.markdown("### 🔌 本地录题 API")
+    st.caption("让本地网页、浏览器脚本或 GPT 辅助工具把识别结果送入草稿区；批准与正式入库仍必须人工完成。")
+
+    st.markdown(
+        """
+        <div class="mc-maintenance-note">
+            <strong>权限边界</strong><br>
+            本地 API 只允许创建、修改、校验和查询草稿。它不会提供批准草稿或写入正式题库的接口，
+            因此网页脚本即使误调用，也不能绕过“草稿审核与逐题确认”。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    default_url = str(st.session_state.get("local_api_base_url") or "http://127.0.0.1:8765").rstrip("/")
+    base_url = st.text_input("API 地址", value=default_url, key="local_api_base_url")
+    token = st.text_input(
+        "本次 API token",
+        type="password",
+        key="local_api_token",
+        help="启动 API 的命令行窗口会显示本次 token。token 只保存在当前浏览器会话，不写入项目文件。",
+    )
+
+    check_col, clear_col = st.columns([1, 1], gap="small")
+    with check_col:
+        check_api = st.button("检查 API 状态", key="local_api_check", type="primary", use_container_width=True)
+    with clear_col:
+        if st.button("清空 token", key="local_api_clear_token", use_container_width=True, on_click=_clear_local_api_token):
+            st.rerun()
+
+    if check_api:
+        normalized_url = str(base_url or "").strip().rstrip("/")
+        if not normalized_url.startswith(("http://", "https://")):
+            st.error("API 地址必须以 http:// 或 https:// 开头。")
+        else:
+            try:
+                health_response = requests.get(f"{normalized_url}/health", timeout=3)
+                health_response.raise_for_status()
+                health_payload = health_response.json()
+                if health_payload.get("draft_only") is True:
+                    st.success("本地录题 API 正在运行，当前为草稿模式。")
+                else:
+                    st.warning("服务已响应，但不是 MathCyclus 草稿 API。")
+                migration = health_payload.get("migration") or {}
+                st.caption(
+                    f"数据库迁移：{migration.get('status', '未知')} · "
+                    f"题库路径：{health_payload.get('database', '未知')}"
+                )
+                if token.strip():
+                    auth_response = requests.get(
+                        f"{normalized_url}/api/v1/drafts?limit=1",
+                        headers={"Authorization": f"Bearer {token.strip()}"},
+                        timeout=3,
+                    )
+                    if auth_response.status_code == 200:
+                        st.caption("token 校验通过。")
+                    else:
+                        st.warning(f"服务可达，但 token 校验未通过（HTTP {auth_response.status_code}）。")
+                else:
+                    st.info("尚未填写 token；只能检查公开健康状态，调用草稿接口时仍需要 token。")
+            except requests.exceptions.RequestException as exc:
+                st.error(f"无法连接本地 API：{exc}")
+            except ValueError:
+                st.error("API 返回的不是有效 JSON，请确认端口对应的是 MathCyclus 本地 API。")
+
+    start_script = Path(BASE_DIR) / "启动本地录题API.bat"
+    js_path = Path(BASE_DIR) / "api" / "question_bank_api.js"
+    docs_path = Path(BASE_DIR) / "docs" / "api" / "local_draft_api.md"
+    st.markdown("#### 启动与调用")
+    st.code("双击项目根目录：启动本地录题API.bat", language="text")
+    st.caption("保持 API 窗口运行，在窗口中复制本次 token，再回到上方检查连接。普通 ChatGPT 网页需要通过本地辅助网页或浏览器扩展调用 JS。")
+
+    download_col, docs_col = st.columns([1, 1], gap="small")
+    with download_col:
+        if js_path.is_file():
+            st.download_button(
+                "下载 JS 客户端",
+                data=js_path.read_bytes(),
+                file_name="question_bank_api.js",
+                mime="text/javascript",
+                key="local_api_download_js",
+                use_container_width=True,
+            )
+    with docs_col:
+        if docs_path.is_file():
+            st.download_button(
+                "下载 API 使用说明",
+                data=docs_path.read_text(encoding="utf-8"),
+                file_name="local_draft_api.md",
+                mime="text/markdown",
+                key="local_api_download_docs",
+                use_container_width=True,
+            )
+
+    with st.expander("当前 API 能做什么", expanded=False):
+        st.markdown(
+            """
+            - 创建批量或单题草稿
+            - 修改题干、选项、来源、TeX 和图片引用
+            - 运行字段校验、完全重复/高度相似查找和同卷位置冲突检查
+            - 查询正式题库和查看审核事件
+
+            **不会通过 API 完成批准或正式入库。**
+            """
+        )
+
+
+def render_runtime_capability_tool():
+    """Display the same parser capability snapshot used by import workflows."""
+    from services.runtime_capability_service import capability_warnings, runtime_capabilities
+
+    st.markdown("### 🧪 运行能力诊断")
+    st.caption("这里的状态来自当前 Python 环境和 .env 配置；它不会把可选组件误报为题库录入失败。")
+    try:
+        report = runtime_capabilities()
+    except Exception as exc:
+        st.error(f"读取运行能力失败：{exc}")
+        return
+
+    preferred = report.get("preferred_parser") or "unknown"
+    preferred_labels = {"mineru_cloud": "MinerU 云端", "pymupdf": "PyMuPDF 回退"}
+    st.info(f"当前自动解析首选：{preferred_labels.get(preferred, preferred)}。{report.get('boundary') or ''}")
+    warnings = capability_warnings(report)
+    if warnings:
+        for warning in warnings:
+            st.warning(warning)
+    else:
+        st.success("当前解析和图片处理能力完整。")
+
+    columns = st.columns(3, gap="small")
+    for index, item in enumerate(report.get("capabilities") or []):
+        with columns[index % 3]:
+            state = "可用" if item.get("available") else "不可用 / 未配置"
+            if item.get("available"):
+                st.success(f"{item.get('name')} · {state}")
+            else:
+                st.error(f"{item.get('name')} · {state}")
+            st.caption(str(item.get("detail") or ""))
+            required_for = "、".join(item.get("required_for") or [])
+            if required_for:
+                st.caption(f"用途：{required_for}")
+
+    with st.expander("解析器能力明细", expanded=False):
+        for parser in report.get("parsers") or []:
+            status = "可用" if parser.get("available") else "不可用 / 未配置"
+            st.markdown(f"**{parser.get('name')}** · {status} · {', '.join(parser.get('capabilities') or [])}")
+            detail = parser.get("detail") or {}
+            if detail:
+                st.json(detail)
+
+
 def page_tools():
     st.header("🛠️ 工具箱")
 
@@ -19768,6 +20850,24 @@ def page_tools():
             st.rerun()
         render_asset_audit_tool()
         return
+    if st.session_state.get("tools_subpage") == "local_api":
+        if st.button("⬅️ 返回工具箱", type="secondary"):
+            st.session_state["tools_subpage"] = None
+            st.rerun()
+        render_local_api_tool()
+        return
+    if st.session_state.get("tools_subpage") == "ai_data_factory":
+        if st.button("⬅️ 返回工具箱", type="secondary"):
+            st.session_state["tools_subpage"] = None
+            st.rerun()
+        render_ai_data_factory_tool()
+        return
+    if st.session_state.get("tools_subpage") == "runtime_capabilities":
+        if st.button("⬅️ 返回工具箱", type="secondary"):
+            st.session_state["tools_subpage"] = None
+            st.rerun()
+        render_runtime_capability_tool()
+        return
     st.markdown("""
     <style>
     /* 工具卡片网格布局：一行三个 */
@@ -19777,7 +20877,7 @@ def page_tools():
         gap: 20px;
         margin-top: 15px;
     }
-    
+
     /* 单个工具卡片样式 */
     .tool-card {
         background-color: var(--mc-surface);
@@ -19900,8 +21000,8 @@ def page_tools():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 第二行：三列
-    r2_c1, r2_c2, r2_c3 = st.columns([1, 1, 1])
+    # 第二行：四列
+    r2_c1, r2_c2, r2_c3, r2_c4 = st.columns([1, 1, 1, 1])
     with r2_c1:
         st.markdown("""
         <div class="tool-card tool-card-four">
@@ -19941,6 +21041,38 @@ def page_tools():
             st.session_state.pop("duplicate_scan_results", None)
             st.rerun()
 
+    with r2_c4:
+        st.markdown(
+            """
+            <div class="tool-card tool-card-four">
+                <div class="tool-title">🏭 8. AI 题目数据工厂</div>
+                <div class="tool-desc">统一管理 PDF Asset、解析 Job、云端 MinerU/PyMuPDF、页面 AI、图片裁剪、草稿生成和人工审核。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("<style>div:has(> button[key='btn_tools_ai_data_factory']) { margin-top: -65px; padding: 0 18px; position: relative; z-index: 10; }</style>", unsafe_allow_html=True)
+        if st.button("进入 AI 题目数据工厂", key="btn_tools_ai_data_factory", use_container_width=True):
+            st.session_state["tools_subpage"] = "ai_data_factory"
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    capability_col, _ = st.columns([1, 3])
+    with capability_col:
+        st.markdown(
+            """
+            <div class="tool-card tool-card-four">
+                <div class="tool-title">🧪 9. 运行能力诊断</div>
+                <div class="tool-desc">集中检查 MinerU 云端、PyMuPDF、Pillow、OpenCV 和本地 OCR，并显示当前自动回退边界。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("<style>div:has(> button[key='btn_tools_runtime_capabilities']) { margin-top: -65px; padding: 0 18px; position: relative; z-index: 10; }</style>", unsafe_allow_html=True)
+        if st.button("查看运行能力", key="btn_tools_runtime_capabilities", use_container_width=True):
+            st.session_state["tools_subpage"] = "runtime_capabilities"
+            st.rerun()
+
     render_operation_log_panel()
 
 
@@ -19973,146 +21105,8 @@ def batch_extract_tikz_all():
                 
     return updated_files
 
-def add_blank_lines_to_all():
-    count = 0
-    for root, dirs, files in os.walk(CHAPTERS_DIR):
-        for file in files:
-            if not file.endswith(".tex"): continue
-            
-            file_path = os.path.join(root, file)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                # 使用简单的正则或字符串处理
-                # 这里复用之前的逻辑：查找 \begin{problem}... 到 \end{problem}
-                # 简单起见，我们假设文件就是标准的 problem 结构
-                
-                lines = content.split('\n')
-                new_lines = []
-                in_problem = False
-                modified = False
-                
-                for i, line in enumerate(lines):
-                    if "\\begin{problem}" in line:
-                        in_problem = True
-                        new_lines.append(line)
-                        continue
-                    if "\\end{problem}" in line:
-                        in_problem = False
-                        new_lines.append(line)
-                        continue
-                        
-                    if in_problem:
-                        # 如果当前行不空，且上一行不空，且不是环境开始，则加空行
-                        # 但要小心不要破坏数学公式块 $ ... $
-                        # 这是一个简化的处理，主要针对文本段落
-                        
-                        # 简单策略：如果当前行是非空文本，且上一行也是非空文本，插入空行
-                        # 但为了安全，我们只处理显式的中文段落结尾？
-                        # 或者复用之前的逻辑：每行后面加一个空行，如果已经有空行则不加
-                        
-                        # 更稳健的策略：读取内容，如果发现没有空行分隔的段落，则插入
-                        # 这里我们采用保守策略：如果当前行有内容，且下一行也有内容，中间插入空行
-                        # 并不容易完美自动化。
-                        # 让我们回退到最安全的方式：不做复杂语法分析，仅提示用户
-                        # 或者，只处理显式的文字段落。
-                        
-                        # 实际上，之前的 update_doc.py 逻辑比较复杂。
-                        # 在这里，我们实现一个简化版本：确保 \end{problem} 前有一行空行，
-                        # 以及 \begin{problem} 后有一行空行（如果不为空的话）。
-                        # 真正的段落间空行最好人工确认。
-                        
-                        # 重新考虑：用户之前的需求是“分行加空行”。
-                        # 我们可以简单地将非空行之间插入空行。
-                        
-                        stripped = line.strip()
-                        if stripped:
-                            new_lines.append(line)
-                            # 如果下一行不是空行，也不是 end problem，则添加空行
-                            if i + 1 < len(lines):
-                                next_line = lines[i+1].strip()
-                                if next_line and "\\end{problem}" not in next_line:
-                                    new_lines.append("") # 插入空行
-                                    modified = True
-                        else:
-                            new_lines.append(line)
-                    else:
-                        new_lines.append(line)
-                
-                if modified:
-                    new_content = "\n".join(new_lines)
-                    if new_content != content:
-                        atomic_write_text(file_path, new_content, backup=True)
-                        count += 1
-            except Exception as e:
-                print(f"Error processing {file}: {e}")
-                
-    return count
 
 
-def standardize_national_papers():
-    # 这里集成之前的重命名逻辑
-    count = 0
-    local_keywords = [
-        "北京", "上海", "天津", "重庆", "浙江", "江苏", "江西", "山东", 
-        "湖北", "湖南", "广东", "福建", "辽宁", "吉林", "黑龙江", 
-        "河北", "河南", "山西", "陕西", "四川", "云南", "贵州", 
-        "安徽", "广西", "海南", "内蒙古", "西藏", "青海", "宁夏", 
-        "新疆", "甘肃", "港", "澳", "台"
-    ]
-    
-    for root, dirs, files in os.walk(CHAPTERS_DIR):
-        for file in files:
-            if not file.endswith(".tex"): continue
-            
-            parts = file[:-4].split('-')
-            if len(parts) != 5: continue
-            
-            year_str, type_str, paper_name, number, subject = parts
-            try:
-                year = int(year_str)
-            except:
-                continue
-                
-            # 过滤地方卷和甲乙卷
-            is_local = any(kw in paper_name for kw in local_keywords)
-            if is_local or "甲卷" in paper_name or "乙卷" in paper_name:
-                continue
-                
-            new_paper_name = paper_name
-            # 规则匹配
-            if 2020 <= year <= 2022:
-                if "新课标" in new_paper_name: new_paper_name = new_paper_name.replace("新课标", "新高考")
-                if "新高考全国" in new_paper_name: new_paper_name = new_paper_name.replace("新高考全国", "新高考")
-            elif 2023 <= year <= 2025:
-                if "新高考" in new_paper_name: new_paper_name = new_paper_name.replace("新高考", "新课标")
-                if "新课标全国" in new_paper_name: new_paper_name = new_paper_name.replace("新课标全国", "新课标")
-            
-            if new_paper_name != paper_name:
-                # 重命名文件
-                new_filename = f"{year_str}-{type_str}-{new_paper_name}-{number}-{subject}.tex"
-                old_path = os.path.join(root, file)
-                new_path = os.path.join(root, new_filename)
-                
-                # 更新内容中的标签
-                try:
-                    with open(old_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    # 替换 {paper_name} 为 {new_paper_name}
-                    # 简单的字符串替换可能误伤，使用比较精确的替换
-                    old_tag = f"{{{paper_name}}}"
-                    new_tag = f"{{{new_paper_name}}}"
-                    content = content.replace(old_tag, new_tag, 1) # 只替换第一个匹配（通常是标签）
-                    
-                    atomic_write_text(old_path, content, backup=True)
-                        
-                    os.rename(old_path, new_path)
-                    st.write(f"已重命名: {file} -> {new_filename}")
-                    count += 1
-                except Exception as e:
-                    st.error(f"处理 {file} 时出错: {e}")
-    return count
 
 # ================= 页面：标签与属性修改 (含搜索) =================
 def update_question_meta(fpath, key, value):
@@ -22069,173 +23063,6 @@ def page_advanced_search():
         render_advanced_search_results()
 
 
-@st.dialog("三级查找", width="large")
-def advanced_search_compare_dialog():
-    """Search existing questions without leaving the current entry draft."""
-    st.markdown(
-        "<div class='mc-adv-dialog-caption'>在录入新题时查找已有题目，仅用于对照，不会修改当前草稿或正式题库。</div>",
-        unsafe_allow_html=True,
-    )
-    render_advanced_search_inline(compact=True)
-    if st.session_state.get("adv_search_active") and _adv_search_has_query():
-        results = _get_advanced_search_results()
-        render_advanced_search_results(results=results)
-
-
-@st.dialog("题目预览", width="large")
-def _duplicate_question_preview_dialog_legacy(question_id: str):
-    """Preview an existing question without leaving the current draft."""
-    from services.database_service import DEFAULT_DATABASE_PATH
-
-    question_id = str(question_id or "").strip()
-    title_col, close_col = st.columns([8, 1], vertical_alignment="center")
-    with title_col:
-        st.markdown(f"### 已有题目 · {html.escape(question_id)}")
-    with close_col:
-        if st.button("×", key=f"close_duplicate_preview_{_question_key('duplicate-preview', question_id)}", help="关闭预览"):
-            st.session_state["duplicate_question_preview_id"] = ""
-            st.rerun()
-
-    try:
-        payload = _db_preview_question_payload(
-            DEFAULT_DATABASE_PATH,
-            question_id,
-            os.path.getmtime(DEFAULT_DATABASE_PATH),
-        )
-        question = payload.get("question") or {}
-        if not question:
-            st.warning(f"未找到题目：{question_id}")
-            return
-        st.caption(_db_preview_label(question))
-        _render_preview_with_inline_assets(payload.get("preview_markdown") or "")
-    except Exception as exc:
-        st.error(f"读取题目预览失败：{exc}")
-
-
-def duplicate_question_preview_dialog(question_id: str):
-    """Render a movable, non-modal duplicate preview beside the draft."""
-    from services.database_service import DEFAULT_DATABASE_PATH
-
-    question_id = str(question_id or "").strip()
-    panel_key = _question_key("duplicate-floating-preview", question_id)
-    st.markdown(
-        """
-        <style>
-        .mc-duplicate-preview-panel {
-            position: fixed !important;
-            right: 26px !important;
-            top: 96px !important;
-            width: 620px !important;
-            height: 620px !important;
-            min-width: 420px !important;
-            min-height: 280px !important;
-            max-width: calc(100vw - 84px) !important;
-            max-height: calc(100vh - 116px) !important;
-            z-index: 1010 !important;
-            overflow: auto !important;
-            padding: 1rem !important;
-            border: 1px solid rgba(119, 102, 142, 0.30) !important;
-            border-radius: 12px !important;
-            background: #faf8ff !important;
-            box-shadow: 0 18px 42px rgba(36, 28, 52, 0.22) !important;
-        }
-        .mc-duplicate-preview-panel h4 { cursor: move !important; user-select: none !important; }
-        .mc-duplicate-preview-resize-grip {
-            position: absolute !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            width: 34px !important;
-            height: 34px !important;
-            cursor: nwse-resize !important;
-            touch-action: none !important;
-            z-index: 20 !important;
-            background: linear-gradient(135deg, transparent 58%, rgba(109, 40, 217, 0.48) 59%, rgba(109, 40, 217, 0.48) 64%, transparent 65%);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    components.html(
-        """
-        <script>
-        (() => {
-            const doc = window.parent.document;
-            const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-            function bind() {
-                const marker = doc.querySelector('.mc-duplicate-preview-anchor');
-                const panel = marker ? marker.closest('div[data-testid="stVerticalBlockBorderWrapper"]') : null;
-                if (!panel) return;
-                panel.classList.add('mc-duplicate-preview-panel');
-                if (panel.dataset.mcDuplicateBound === '1') return;
-                panel.dataset.mcDuplicateBound = '1';
-                const grip = doc.createElement('div');
-                grip.className = 'mc-duplicate-preview-resize-grip';
-                panel.appendChild(grip);
-                const saved = (name, fallback) => Number(window.parent.localStorage.getItem(name) || fallback);
-                panel.style.setProperty('width', `${clamp(saved('mcDuplicatePreviewWidth', 620), 420, window.parent.innerWidth - 84)}px`, 'important');
-                panel.style.setProperty('height', `${clamp(saved('mcDuplicatePreviewHeight', 620), 280, window.parent.innerHeight - 116)}px`, 'important');
-                const x = Number(window.parent.localStorage.getItem('mcDuplicatePreviewX'));
-                const y = Number(window.parent.localStorage.getItem('mcDuplicatePreviewY'));
-                if (Number.isFinite(x) && Number.isFinite(y)) {
-                    panel.style.setProperty('left', `${clamp(x, 72, window.parent.innerWidth - panel.offsetWidth - 12)}px`, 'important');
-                    panel.style.setProperty('top', `${clamp(y, 12, window.parent.innerHeight - 90)}px`, 'important');
-                    panel.style.setProperty('right', 'auto', 'important');
-                }
-                let moving = false, resizing = false, ox = 0, oy = 0, sx = 0, sy = 0, sw = 0, sh = 0;
-                panel.addEventListener('pointerdown', (event) => {
-                    const rect = panel.getBoundingClientRect();
-                    if (event.target.closest('.mc-duplicate-preview-resize-grip') || (rect.right - event.clientX <= 34 && rect.bottom - event.clientY <= 34)) {
-                        resizing = true; sx = event.clientX; sy = event.clientY; sw = rect.width; sh = rect.height;
-                        panel.setPointerCapture(event.pointerId); event.preventDefault(); event.stopPropagation(); return;
-                    }
-                    if (!event.target.closest('h4')) return;
-                    moving = true; ox = event.clientX - rect.left; oy = event.clientY - rect.top;
-                    panel.setPointerCapture(event.pointerId); event.preventDefault();
-                });
-                panel.addEventListener('pointermove', (event) => {
-                    if (resizing) {
-                        const width = clamp(sw + event.clientX - sx, 420, window.parent.innerWidth - panel.getBoundingClientRect().left - 12);
-                        const height = clamp(sh + event.clientY - sy, 280, window.parent.innerHeight - panel.getBoundingClientRect().top - 12);
-                        panel.style.setProperty('width', `${width}px`, 'important'); panel.style.setProperty('height', `${height}px`, 'important');
-                        window.parent.localStorage.setItem('mcDuplicatePreviewWidth', width); window.parent.localStorage.setItem('mcDuplicatePreviewHeight', height); return;
-                    }
-                    if (!moving) return;
-                    const rect = panel.getBoundingClientRect();
-                    const x = clamp(event.clientX - ox, 72, window.parent.innerWidth - rect.width - 12);
-                    const y = clamp(event.clientY - oy, 12, window.parent.innerHeight - 90);
-                    panel.style.setProperty('left', `${x}px`, 'important'); panel.style.setProperty('top', `${y}px`, 'important'); panel.style.setProperty('right', 'auto', 'important');
-                    window.parent.localStorage.setItem('mcDuplicatePreviewX', x); window.parent.localStorage.setItem('mcDuplicatePreviewY', y);
-                });
-                panel.addEventListener('pointerup', () => { moving = false; resizing = false; });
-                panel.addEventListener('pointercancel', () => { moving = false; resizing = false; });
-            }
-            bind(); window.parent.setTimeout(bind, 80); window.parent.setTimeout(bind, 300);
-            if (window.parent.__mcDuplicatePreviewObserver) window.parent.__mcDuplicatePreviewObserver.disconnect();
-            window.parent.__mcDuplicatePreviewObserver = new window.parent.MutationObserver(bind);
-            window.parent.__mcDuplicatePreviewObserver.observe(doc.body, {childList: true, subtree: true});
-        })();
-        </script>
-        """,
-        height=0,
-    )
-    with st.container(border=True):
-        st.markdown('<span class="mc-duplicate-preview-anchor"></span>', unsafe_allow_html=True)
-        title_col, close_col = st.columns([8, 1], vertical_alignment="center")
-        with title_col:
-            st.markdown(f"#### 已有题目 · {html.escape(question_id)}")
-        with close_col:
-            if st.button("×", key=f"close_duplicate_floating_{panel_key}", help="关闭预览"):
-                st.session_state["duplicate_question_preview_id"] = ""
-                st.rerun()
-        try:
-            payload = _db_preview_question_payload(DEFAULT_DATABASE_PATH, question_id, os.path.getmtime(DEFAULT_DATABASE_PATH))
-            question = payload.get("question") or {}
-            st.caption(_db_preview_label(question))
-            _render_preview_with_inline_assets(payload.get("preview_markdown") or "")
-        except Exception as exc:
-            st.error(f"读取题目预览失败：{exc}")
-
-
 def render_duplicate_question_preview_panel(question_id: str) -> None:
     """Pre-render a hidden preview so duplicate links open without a rerun."""
     from services.database_service import DEFAULT_DATABASE_PATH
@@ -22596,9 +23423,9 @@ def render_advanced_search_floating_panel():
             width: 58px !important;
             min-width: 58px !important;
             max-width: 58px !important;
-            height: 58px !important;
-            min-height: 58px !important;
-            max-height: 58px !important;
+            height: 122px !important;
+            min-height: 122px !important;
+            max-height: 122px !important;
             z-index: 1005 !important;
             padding: 0 !important;
             border: 0 !important;
@@ -22629,6 +23456,14 @@ def render_advanced_search_floating_panel():
             height: 58px !important;
             min-height: 58px !important;
             max-height: 58px !important;
+            padding: 0 !important;
+        }
+        .mc-advanced-floating-collapsed .mc-page-top-anchor {
+            display: block !important;
+            width: 0 !important;
+            height: 0 !important;
+            min-height: 0 !important;
+            margin: 0 !important;
             padding: 0 !important;
         }
         @media (max-width: 980px) {
@@ -22669,7 +23504,7 @@ def render_advanced_search_floating_panel():
                     collapsed.classList.add('mc-advanced-floating-collapsed');
                     const collapsedStyles = {
                         width: '58px', minWidth: '58px', maxWidth: '58px',
-                        height: '58px', minHeight: '58px', maxHeight: '58px',
+                        height: '122px', minHeight: '122px', maxHeight: '122px',
                         left: 'auto', right: '18px', top: '50vh',
                         transform: 'translateY(-50%)', overflow: 'visible',
                         margin: '0', padding: '0', boxSizing: 'border-box'
@@ -22751,12 +23586,34 @@ def render_advanced_search_floating_panel():
         """,
         height=0,
     )
+    if st.session_state.pop("mc_page_scroll_to_top", False):
+        components.html(
+            """
+            <script>
+            (() => {
+                const win = window.parent;
+                const doc = win.document;
+                win.scrollTo({ top: 0, behavior: "auto" });
+                doc.documentElement.scrollTop = 0;
+                doc.body.scrollTop = 0;
+                doc.querySelectorAll('div[data-testid="column"]').forEach((node) => {
+                    if (node.scrollHeight > node.clientHeight) node.scrollTop = 0;
+                });
+            })();
+            </script>
+            """,
+            height=0,
+        )
     if not panel_open:
         with st.container(border=True):
             st.markdown('<span class="mc-advanced-floating-collapsed-anchor"></span>', unsafe_allow_html=True)
             if st.button("🔍", key="mc_advanced_search_open", help="展开三级查找", use_container_width=True):
                 st.session_state["advanced_search_panel_open"] = True
                 st.session_state["advanced_search_panel_collapsed"] = False
+                st.rerun(scope="fragment")
+            st.markdown('<span class="mc-page-top-anchor"></span>', unsafe_allow_html=True)
+            if st.button("⬆️", key="mc_page_scroll_to_top_button", help="回到页面顶部", use_container_width=True):
+                st.session_state["mc_page_scroll_to_top"] = True
                 st.rerun(scope="fragment")
         return
 
@@ -22831,7 +23688,27 @@ def _render_sqlite_migration_onboarding_notice(surface: str = ""):
 
 
 # ================= 主程序 =================
+def _ensure_runtime_database_schema() -> dict:
+    """Apply pending safe schema migrations before any SQLite workflow runs."""
+    from services.database_service import DEFAULT_DATABASE_PATH
+    from services.schema_migration_service import apply_pending_migrations
+
+    return apply_pending_migrations(
+        DEFAULT_DATABASE_PATH,
+        apply=True,
+        backup=True,
+    )
+
+
 def main():
+    try:
+        migration_result = _ensure_runtime_database_schema()
+        if migration_result.get("status") == "blocked":
+            st.error("SQLite 数据库迁移被阻止：检测到已应用迁移与当前代码不一致，请先备份并检查迁移状态。")
+            return
+    except Exception as exc:
+        st.error(f"SQLite 数据库迁移失败，暂不进入录题页面：{exc}")
+        return
     st.set_page_config(page_title="高中数学题库管理系统", layout="wide", initial_sidebar_state="expanded")
 
     inject_custom_css()
@@ -22993,50 +23870,13 @@ def main():
             min-width: 110px !important;
             max-width: 110px !important;
         }
-        [data-testid="stSidebarContent"] {
-            width: 110px !important;
-            min-width: 110px !important;
-            max-width: 110px !important;
-            padding-left: 0 !important;
-            padding-right: 0 !important;
-            box-sizing: border-box !important;
-            overflow-x: visible !important;
-        }
-
         /* 调整内部边距，让内容完全居中 */
         [data-testid="stSidebarUserContent"] {
-            width: 100% !important;
-            min-width: 0 !important;
-            max-width: 100% !important;
             padding: 0.3rem 0rem 1rem 0rem !important;
             display: flex !important;
             flex-direction: column !important;
-            align-items: stretch !important;
+            align-items: center !important;
             justify-content: flex-start !important;
-        }
-        [data-testid="stSidebarUserContent"] > div,
-        [data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> .st-key-main_sidebar_radio),
-        [data-testid="stSidebar"] .st-key-main_sidebar_radio,
-        [data-testid="stSidebar"] div[data-testid="stRadio"],
-        [data-testid="stSidebar"] div[data-testid="stRadio"] > div {
-            width: 100% !important;
-            min-width: 0 !important;
-            max-width: 100% !important;
-            box-sizing: border-box !important;
-        }
-        [data-testid="stSidebar"] .st-key-main_sidebar_radio {
-            align-self: stretch !important;
-            overflow: visible !important;
-        }
-        [data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> .st-key-main_sidebar_radio) {
-            align-self: stretch !important;
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-            padding-left: 0 !important;
-            padding-right: 0 !important;
-        }
-        [data-testid="stSidebar"] div[data-testid="stRadio"] {
-            overflow: visible !important;
         }
 
         /* 原生切换由持久代理触发，避免 Streamlit 重建控件时产生闪烁。 */
@@ -23490,15 +24330,21 @@ def main():
             <style>
             [data-testid="stSidebar"] div[data-testid="stImage"] {
                 display: flex !important;
+                align-items: center !important;
                 justify-content: center !important;
-                width: 90px !important;
-                min-width: 90px !important;
-                max-width: 90px !important;
-                margin: 0 auto 4px auto !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
+                margin: 0 0 4px 0 !important;
             }
-            [data-testid="stSidebar"] div[data-testid="stImage"] img {
+            [data-testid="stSidebar"] div[data-testid="stImage"] img,
+            [data-testid="stSidebar"] div[data-testid="stImage"] > div,
+            [data-testid="stSidebar"] div[data-testid="stImage"] > div > img {
+                display: block !important;
                 width: 72px !important;
                 max-width: 72px !important;
+                margin-left: auto !important;
+                margin-right: auto !important;
                 height: auto !important;
             }
             .sol-logo-link,
@@ -23506,9 +24352,9 @@ def main():
             .sol-logo-link:hover,
             .sol-logo-link:active {
                 display: block !important;
-                width: 90px !important;
-                min-width: 90px !important;
-                max-width: 90px !important;
+                width: 100% !important;
+                min-width: 0 !important;
+                max-width: 100% !important;
                 margin-left: auto !important;
                 margin-right: auto !important;
                 box-sizing: border-box !important;

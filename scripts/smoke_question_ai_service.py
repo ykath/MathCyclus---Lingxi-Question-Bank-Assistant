@@ -75,6 +75,9 @@ def main() -> int:
             and "严禁自行解题" in str(content[0].get("text") if content else ""),
             "configured_model_used": captured.get("payload", {}).get("model") == "qwen-vl-plus",
             "page_tex_result": bool(page_result.get("tex")),
+            "page_provenance_model": page_result.get("model_name") == "qwen-vl-plus",
+            "page_provenance_prompt": page_result.get("prompt_file") == "ocr_prompt.txt" and bool(page_result.get("prompt_sha256")),
+            "page_recognizer_version": page_result.get("recognizer_version") == "page_v1",
             "page_prompt_requests_full_tex": "一次性识别本页所有完整或部分出现的题目" in str(captured.get("payload", {}).get("messages", [{}])[0].get("content", [{}])[0].get("text", "")),
         }
         recovered = ai_service.normalize_question_structure_result(

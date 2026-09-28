@@ -6,11 +6,10 @@ import hashlib
 import itertools
 import os
 import re
-import unicodedata
-from difflib import SequenceMatcher
 
 from services.file_service import atomic_write_text
 from services.operation_log import record_operation
+from services.question_similarity_service import extract_similarity_payload, score_question_pair
 from utils.core_config import CHAPTERS_DIR
 from utils.csv_ops import CSV_HEADERS, add_to_csv_index, read_csv_index
 
@@ -59,14 +58,9 @@ def extract_question_stem(content: str) -> str:
 
 def normalize_question_text(content: str) -> str:
     """Normalize harmless LaTeX/layout differences without changing meaning."""
-    text = extract_question_stem(content)
-    text = _COMMENT_RE.sub("", text)
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"\\(?:left|right)\b", "", text)
-    text = re.sub(r"\\(?:!|,|;|:|quad|qquad|enspace)\b", "", text)
-    text = re.sub(r"\\hspace\s*\{[^{}]*\}", "", text)
-    text = re.sub(r"\s+", "", text)
-    return text.strip()
+    from services.question_similarity_service import normalize_similarity_text
+
+    return normalize_similarity_text(extract_question_stem(content))[0]
 
 
 def question_fingerprint(content: str) -> str:
@@ -130,22 +124,22 @@ def _row_path(row: dict) -> str:
 def _row_stem(row: dict) -> str:
     stem = str(row.get(STEM_FIELD, "") or "").strip()
     if stem:
-        return normalize_question_text(stem)
+        return extract_question_stem(stem)
 
     path = _row_path(row)
     if not path or not os.path.isfile(path):
         return ""
     try:
         with open(path, "r", encoding="utf-8") as question_file:
-            return normalize_question_text(question_file.read())
+            return extract_question_stem(question_file.read())
     except (OSError, UnicodeError):
         return ""
 
 
-def _match_payload(row: dict, score: float, kind: str) -> dict:
-    return {
+def _match_payload(row: dict, score: float | None, kind: str, detail: dict | None = None) -> dict:
+    payload = {
         "kind": kind,
-        "score": round(float(score), 4),
+        "score": round(float(score), 4) if score is not None else None,
         "question_id": str(row.get(ID_FIELD, "") or ""),
         "name": str(row.get(NAME_FIELD, "") or ""),
         "path": _row_path(row),
@@ -153,6 +147,19 @@ def _match_payload(row: dict, score: float, kind: str) -> dict:
         "question_type": str(row.get(TYPE_FIELD, "") or ""),
         "subject": str(row.get(SUBJECT_FIELD, "") or ""),
     }
+    if detail:
+        numeric_keys = {
+            "base_score", "ratio", "cover", "numf", "template_score",
+            "bigram_jaccard", "bigram_containment",
+        }
+        for key in (
+            "channel", "base_score", "ratio", "cover", "numf", "template_score",
+            "bigram_jaccard", "bigram_containment", "choice_mode", "reasons", "warnings",
+        ):
+            if key in detail:
+                value = detail[key]
+                payload[key] = round(float(value), 4) if key in numeric_keys and value is not None else value
+    return payload
 
 
 def _can_reach_similarity(left: str, right: str, threshold: float) -> bool:
@@ -172,12 +179,12 @@ def find_duplicate_matches(
     max_results: int = 20,
 ) -> list[dict]:
     """Return exact and highly similar existing questions for a candidate."""
-    normalized = normalize_question_text(content)
+    target_stem = extract_question_stem(content)
+    normalized = normalize_question_text(target_stem)
     if not normalized:
         return []
 
     target_path = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else ""
-    target_fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     matches = []
     for row in rows if rows is not None else read_csv_index():
         row_path = _row_path(row)
@@ -186,19 +193,17 @@ def find_duplicate_matches(
         candidate = _row_stem(row)
         if not candidate:
             continue
-        candidate_fingerprint = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
-        if candidate_fingerprint == target_fingerprint:
-            matches.append(_match_payload(row, 1.0, "exact"))
-            continue
-
-        if not _can_reach_similarity(normalized, candidate, similarity_threshold):
-            continue
-        matcher = SequenceMatcher(None, normalized, candidate, autojunk=False)
-        if matcher.quick_ratio() < similarity_threshold:
-            continue
-        score = matcher.ratio()
-        if score >= similarity_threshold:
-            matches.append(_match_payload(row, score, "similar"))
+        detail = score_question_pair(
+            target_stem,
+            candidate,
+            right_choices=row.get("选项") or row.get("choices_json"),
+            right_question_type_id=row.get(TYPE_FIELD),
+        )
+        score = detail.get("score")
+        if detail.get("kind") == "exact":
+            matches.append(_match_payload(row, 1.0, "exact", detail))
+        elif score is not None and float(score) >= similarity_threshold:
+            matches.append(_match_payload(row, score, "similar", detail))
 
     matches.sort(key=lambda item: (item["kind"] != "exact", -item["score"], item["name"]))
     return matches[:max_results]
@@ -215,17 +220,22 @@ def scan_duplicate_pairs(
     exact_groups: dict[str, list[dict]] = {}
     for row in source_rows:
         normalized = _row_stem(row)
-        if not normalized:
+        if not normalized or not normalize_question_text(normalized):
             continue
-        fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        item = {"row": row, "normalized": normalized, "fingerprint": fingerprint}
+        payload = extract_similarity_payload(
+            normalized,
+            row.get("选项") or row.get("choices_json"),
+            row.get(TYPE_FIELD),
+        )
+        fingerprint = hashlib.sha256(payload["stem_norm"].encode("utf-8")).hexdigest()
+        item = {"row": row, "normalized": normalized, "payload": payload, "fingerprint": fingerprint}
         prepared.append(item)
         exact_groups.setdefault(fingerprint, []).append(item)
 
     pairs = []
     seen = set()
 
-    def add_pair(left: dict, right: dict, score: float, kind: str) -> None:
+    def add_pair(left: dict, right: dict, score: float, kind: str, detail: dict | None = None) -> None:
         left_path = _row_path(left["row"])
         right_path = _row_path(right["row"])
         pair_key = tuple(sorted((left_path, right_path)))
@@ -235,13 +245,13 @@ def scan_duplicate_pairs(
         pairs.append({
             "kind": kind,
             "score": round(float(score), 4),
-            "left": _match_payload(left["row"], score, kind),
-            "right": _match_payload(right["row"], score, kind),
+            "left": _match_payload(left["row"], score, kind, detail),
+            "right": _match_payload(right["row"], score, kind, detail),
         })
 
     for group in exact_groups.values():
         for left, right in itertools.combinations(group, 2):
-            add_pair(left, right, 1.0, "exact")
+            add_pair(left, right, 1.0, "exact", {"channel": "完全相同"})
             if len(pairs) >= max_pairs:
                 return pairs
 
@@ -251,14 +261,10 @@ def scan_duplicate_pairs(
         for right in prepared[index + 1:]:
             if left["fingerprint"] == right["fingerprint"]:
                 continue
-            if not _can_reach_similarity(left["normalized"], right["normalized"], similarity_threshold):
-                continue
-            matcher = SequenceMatcher(None, left["normalized"], right["normalized"], autojunk=False)
-            if matcher.quick_ratio() < similarity_threshold:
-                continue
-            score = matcher.ratio()
-            if score >= similarity_threshold:
-                add_pair(left, right, score, "similar")
+            detail = score_question_pair(left["normalized"], right["normalized"])
+            score = detail.get("score")
+            if score is not None and float(score) >= similarity_threshold:
+                add_pair(left, right, score, "similar", detail)
                 if len(pairs) >= max_pairs:
                     break
 

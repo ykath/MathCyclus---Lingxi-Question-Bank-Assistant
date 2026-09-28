@@ -6,8 +6,6 @@ import hashlib
 import json
 import mimetypes
 import re
-import shutil
-from difflib import SequenceMatcher
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,7 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from services.database_service import BASE_DIR, database_connection, existing_database_connection, readonly_database_connection, row_to_dict
+from services.equivalence_service import record_equivalence_event_from_conn
 from services.revision_service import insert_question_revision_from_conn
+from services.question_similarity_service import score_question_pair
 
 
 PROJECT_ROOT = Path(BASE_DIR)
@@ -128,6 +128,139 @@ def stable_id(prefix: str, *values: object, length: int = 14) -> str:
 
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _draft_content_hash_from_conn(conn, draft: dict[str, Any]) -> str:
+    """Hash every field that can change the result of a formal commit."""
+    payload = {
+        "proposed_action": str(draft.get("proposed_action") or ""),
+        "target_question_id": str(draft.get("target_question_id") or ""),
+        "question_type_id": draft.get("question_type_id"),
+        "stem_tex": str(draft.get("stem_tex") or ""),
+        "choices_json": str(draft.get("choices_json") or "[]"),
+        "answer_tex": str(draft.get("answer_tex") or ""),
+        "solution_tex": str(draft.get("solution_tex") or ""),
+        "difficulty": draft.get("difficulty"),
+        "tags_json": str(draft.get("tags_json") or "[]"),
+        "note": str(draft.get("note") or ""),
+        "official_flag": int(draft.get("official_flag") or 0),
+        "raw_source_text": str(draft.get("raw_source_text") or ""),
+        "normalized_tex": str(draft.get("normalized_tex") or ""),
+        "extra_json": str(draft.get("extra_json") or "{}"),
+        "assets": [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT role, source_path, planned_file_path, original_file_name,
+                       mime_type, file_hash, caption, sort_order, review_status,
+                       note, extra_json
+                FROM question_import_draft_asset
+                WHERE draft_id = ?
+                ORDER BY sort_order, draft_asset_id
+                """,
+                (str(draft.get("draft_id") or ""),),
+            ).fetchall()
+        ],
+    }
+    return hashlib.sha256(compact_json(payload).encode("utf-8")).hexdigest()
+
+
+def _record_draft_review_event_conn(
+    conn,
+    draft: dict[str, Any],
+    *,
+    stage: str,
+    from_status: str,
+    to_status: str,
+    decision: str,
+    content_hash: str,
+    operator: str,
+    reason: str = "",
+    detail: dict[str, Any] | None = None,
+) -> str:
+    event_id = stable_id(
+        "DRE",
+        draft.get("draft_id"),
+        stage,
+        from_status,
+        to_status,
+        decision,
+        content_hash,
+        datetime.now().isoformat(timespec="microseconds"),
+    )
+    conn.execute(
+        """
+        INSERT INTO draft_review_event(
+            event_id, draft_id, batch_id, stage, from_status, to_status,
+            decision, content_hash, operator, reason, detail_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            str(draft.get("draft_id") or ""),
+            str(draft.get("batch_id") or ""),
+            stage,
+            from_status,
+            to_status,
+            decision,
+            content_hash,
+            operator,
+            reason,
+            compact_json(detail or {}),
+        ),
+    )
+    return event_id
+
+
+def _clear_draft_approval_conn(conn, draft_id: str) -> None:
+    conn.execute(
+        """
+        UPDATE question_import_draft
+        SET approved_content_hash = '', approved_by = '', approved_at = NULL
+        WHERE draft_id = ?
+        """,
+        (draft_id,),
+    )
+
+
+def _refresh_draft_after_related_change_conn(
+    conn,
+    draft_id: str,
+    *,
+    operator: str = "system",
+    reason: str = "图片资源发生修改，需要重新进行人工二次审核",
+) -> dict[str, Any]:
+    draft = _get_draft_question_from_conn(conn, draft_id)
+    if not draft:
+        raise KeyError(f"草稿不存在：{draft_id}")
+    previous_status = str(draft.get("review_status") or "needs_review")
+    next_status = "needs_review" if previous_status in {"ready", "approved"} else previous_status
+    content_hash = _draft_content_hash_from_conn(conn, draft)
+    conn.execute(
+        """
+        UPDATE question_import_draft
+        SET review_status = ?, review_reason = ?, content_hash = ?,
+            approved_content_hash = '', approved_by = '', approved_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE draft_id = ?
+        """,
+        (next_status, reason if next_status == "needs_review" else str(draft.get("review_reason") or ""), content_hash, draft_id),
+    )
+    updated = dict(draft)
+    updated.update({"review_status": next_status, "content_hash": content_hash})
+    _record_draft_review_event_conn(
+        conn,
+        updated,
+        stage="related_asset_edit",
+        from_status=previous_status,
+        to_status=next_status,
+        decision="edit",
+        content_hash=content_hash,
+        operator=operator,
+        reason=reason,
+    )
+    return updated
 
 
 def parse_json_list(value: Any) -> list[str]:
@@ -274,10 +407,6 @@ def validate_draft_question(draft: DraftQuestionInput) -> dict[str, Any]:
         warnings.append("difficulty 建议在 1-5 之间")
     if draft.question_type_id == QUESTION_TYPE_NAMES["single_choice"] and len(draft.choices) < 2:
         warnings.append("单选题选项少于 2 个")
-    if not draft.answer_tex:
-        warnings.append("缺少 answer_tex")
-    if not draft.solution_tex:
-        warnings.append("缺少 solution_tex")
 
     asset_issues = _draft_reference_issues(draft)
     if asset_issues.get("missing_includegraphics"):
@@ -463,6 +592,12 @@ def insert_draft_question(
                     compact_json(asset.extra),
                 ),
             )
+        inserted_draft = _get_draft_question_from_conn(conn, draft_id)
+        content_hash = _draft_content_hash_from_conn(conn, inserted_draft)
+        conn.execute(
+            "UPDATE question_import_draft SET content_hash = ?, approved_content_hash = '', approved_by = '', approved_at = NULL WHERE draft_id = ?",
+            (content_hash, draft_id),
+        )
     return draft_id, validation
 
 
@@ -529,9 +664,36 @@ def get_draft_question(db_path: str | None, draft_id: str) -> dict:
         return _get_draft_question_from_conn(conn, draft_id)
 
 
+def validate_existing_draft(db_path: str | None, draft_id: str) -> dict[str, Any]:
+    """Validate one persisted draft without changing its review decision.
+
+    This is intentionally read-only so an OCR/AI client can inspect the
+    current validation state without gaining any approval or commit ability.
+    """
+    safe_draft_id = str(draft_id or "").strip()
+    if not safe_draft_id:
+        raise ValueError("draft_id 不能为空")
+    with readonly_database_connection(db_path) as conn:
+        draft = _get_draft_question_from_conn(conn, safe_draft_id)
+        if not draft:
+            raise KeyError(f"草稿不存在：{safe_draft_id}")
+        validation = validate_draft_question(_draft_row_to_input(draft))
+        current_hash = _draft_content_hash_from_conn(conn, draft)
+    approved_hash = str(draft.get("approved_content_hash") or "")
+    return {
+        "draft_id": safe_draft_id,
+        "review_status": str(draft.get("review_status") or "needs_review"),
+        "content_hash": current_hash,
+        "stored_content_hash": str(draft.get("content_hash") or ""),
+        "approved_content_hash": approved_hash,
+        "approval_matches_current": bool(approved_hash and approved_hash == current_hash),
+        "validation": validation,
+    }
+
+
 def list_ready_draft_ids(db_path: str | None, batch_id: str = "") -> list[str]:
     """Return draft IDs that are eligible for commit preview."""
-    clauses = ["review_status IN ('ready', 'approved')"]
+    clauses = ["review_status = 'approved'"]
     params: list[object] = []
     if batch_id:
         clauses.append("batch_id = ?")
@@ -601,28 +763,73 @@ def find_question_content_matches(
     db_path: str | None,
     stem_tex: str,
     *,
+    choices: Any = None,
+    question_type_id: Any = None,
     similarity_threshold: float = 0.88,
     max_results: int = 3,
 ) -> list[dict[str, Any]]:
     """Find SQLite questions with exactly equal or highly similar statements."""
-    from services.question_service import normalize_question_text
+    return find_question_similarity_candidates(
+        db_path,
+        stem_tex,
+        choices=choices,
+        question_type_id=question_type_id,
+        max_results=max_results,
+        minimum_score=similarity_threshold,
+    )
 
-    normalized = normalize_question_text(stem_tex)
-    if not normalized:
+
+def find_question_similarity_candidates(
+    db_path: str | None,
+    stem_tex: str,
+    *,
+    choices: Any = None,
+    question_type_id: Any = None,
+    minimum_score: float = 0.40,
+    max_results: int = 20,
+) -> list[dict[str, Any]]:
+    """Return ranked local candidates using the shared GaokaoWeb score.
+
+    This is intentionally a read-only helper. It is used both by the draft
+    validation page and by the localhost API so an external AI client gets
+    exactly the same candidate order as the Streamlit workflow.
+    """
+    if not str(stem_tex or "").strip():
         return []
+    minimum_score = max(0.0, min(1.0, float(minimum_score)))
+    max_results = max(1, min(int(max_results), 100))
     matches: list[dict[str, Any]] = []
     with readonly_database_connection(db_path) as conn:
-        rows = conn.execute("SELECT question_id, stem_tex FROM question WHERE stem_tex != ''").fetchall()
+        rows = conn.execute(
+            "SELECT question_id, stem_tex, choices_json, question_type_id "
+            "FROM question WHERE stem_tex != ''"
+        ).fetchall()
     for row in rows:
-        candidate = normalize_question_text(str(row["stem_tex"] or ""))
-        if not candidate:
-            continue
-        if candidate == normalized:
-            matches.append({"question_id": str(row["question_id"]), "kind": "exact", "score": 1.0})
-            continue
-        score = SequenceMatcher(None, normalized, candidate, autojunk=False).ratio()
-        if score >= similarity_threshold:
-            matches.append({"question_id": str(row["question_id"]), "kind": "similar", "score": round(score, 4)})
+        detail = score_question_pair(
+            stem_tex,
+            str(row["stem_tex"] or ""),
+            left_choices=choices,
+            right_choices=row["choices_json"],
+            left_question_type_id=question_type_id,
+            right_question_type_id=row["question_type_id"],
+            allow_sub=True,
+        )
+        score = detail.get("score")
+        if detail.get("kind") == "exact" or (score is not None and float(score) >= minimum_score):
+            matches.append({
+                "question_id": str(row["question_id"]),
+                "kind": "exact" if detail.get("kind") == "exact" else "similar",
+                "score": round(float(score), 4) if score is not None else 1.0,
+                "channel": detail.get("channel"),
+                "base_score": round(float(detail.get("base_score") or score or 0), 4),
+                "ratio": round(float(detail.get("ratio") or 0), 4),
+                "cover": round(float(detail.get("cover") or 0), 4),
+                "numf": detail.get("numf"),
+                "template_score": detail.get("template_score"),
+                "choice_mode": detail.get("choice_mode"),
+                "reasons": detail.get("reasons", []),
+                "warnings": detail.get("warnings", []),
+            })
     matches.sort(key=lambda item: (item["kind"] != "exact", -float(item["score"]), item["question_id"]))
     return matches[:max_results]
 
@@ -645,25 +852,105 @@ def update_draft_review_status(
     draft_id: str,
     review_status: str,
     review_reason: str = "",
-) -> None:
+) -> dict[str, Any]:
     """Update draft review status after a commit preview decision."""
     if review_status not in ALLOWED_REVIEW_STATUS:
         raise ValueError(f"unsupported review_status: {review_status}")
+    if review_status == "approved":
+        approve_draft_for_commit(db_path, draft_id, operator="streamlit_ui", note=review_reason)
+        return
     with database_connection(db_path) as conn:
         draft = _get_draft_question_from_conn(conn, draft_id)
         if not draft:
             raise KeyError(f"草稿不存在：{draft_id}")
+        current_status = str(draft.get("review_status") or "")
+        current_hash = _draft_content_hash_from_conn(conn, draft)
         validation = validate_draft_question(_draft_row_to_input(draft))
         if review_status in {"ready", "approved"} and validation.get("status") != "ready":
             raise ValueError("图片引用或字段校验未通过，不能标记为 ready/approved")
         conn.execute(
             """
             UPDATE question_import_draft
-            SET review_status = ?, review_reason = ?, updated_at = CURRENT_TIMESTAMP
+            SET review_status = ?, review_reason = ?, content_hash = ?,
+                approved_content_hash = '', approved_by = '', approved_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
             WHERE draft_id = ?
             """,
-            (review_status, review_reason, draft_id),
+            (review_status, review_reason, current_hash, draft_id),
         )
+        updated = dict(draft)
+        updated.update({"review_status": review_status, "review_reason": review_reason, "content_hash": current_hash})
+        event_id = _record_draft_review_event_conn(
+            conn,
+            updated,
+            stage="human_review",
+            from_status=current_status,
+            to_status=review_status,
+            decision=review_status,
+            content_hash=current_hash,
+            operator="streamlit_ui",
+            reason=review_reason,
+        )
+    return {"draft_id": draft_id, "status": review_status, "content_hash": current_hash, "event_id": event_id}
+
+
+def approve_draft_for_commit(
+    db_path: str | None,
+    draft_id: str,
+    *,
+    operator: str = "human_reviewer",
+    note: str = "",
+) -> dict[str, Any]:
+    """Perform the second human review and bind approval to current content."""
+    safe_draft_id = str(draft_id or "").strip()
+    if not safe_draft_id:
+        raise ValueError("draft_id 不能为空")
+    with database_connection(db_path) as conn:
+        draft = _get_draft_question_from_conn(conn, safe_draft_id)
+        if not draft:
+            raise KeyError(f"草稿不存在：{safe_draft_id}")
+        current_status = str(draft.get("review_status") or "needs_review")
+        if current_status == "committed":
+            raise ValueError("草稿已经入库，不能重复审核")
+        validation = validate_draft_question(_draft_row_to_input(draft))
+        if validation.get("errors"):
+            raise ValueError("草稿存在阻断错误，不能批准：" + "；".join(str(item) for item in validation["errors"]))
+        if validation.get("warnings"):
+            raise ValueError("草稿仍有待人工处理的提醒，不能批准：" + "；".join(str(item) for item in validation["warnings"]))
+        current_hash = _draft_content_hash_from_conn(conn, draft)
+        reviewer = str(operator or "human_reviewer").strip()
+        reason = str(note or "人工二次审核通过").strip()
+        conn.execute(
+            """
+            UPDATE question_import_draft
+            SET review_status = 'approved', review_reason = ?, content_hash = ?,
+                approved_content_hash = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE draft_id = ?
+            """,
+            (reason, current_hash, current_hash, reviewer, safe_draft_id),
+        )
+        updated = dict(draft)
+        updated.update({"review_status": "approved", "review_reason": reason, "content_hash": current_hash})
+        event_id = _record_draft_review_event_conn(
+            conn,
+            updated,
+            stage="human_review",
+            from_status=current_status,
+            to_status="approved",
+            decision="approve",
+            content_hash=current_hash,
+            operator=reviewer,
+            reason=reason,
+            detail={"validation": validation},
+        )
+    return {
+        "draft_id": safe_draft_id,
+        "status": "approved",
+        "content_hash": current_hash,
+        "approved_by": reviewer,
+        "event_id": event_id,
+    }
 
 
 def summarize_batch(db_path: str | None, batch_id: str) -> dict[str, Any]:
@@ -705,6 +992,32 @@ def summarize_batch(db_path: str | None, batch_id: str) -> dict[str, Any]:
         "report_status_counts": {str(row[0]): int(row[1]) for row in report_rows},
         "draft_asset_count": int(asset_count),
     }
+
+
+def list_draft_review_events(
+    db_path: str | None = None,
+    draft_id: str = "",
+    batch_id: str = "",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return immutable human/system review events for audit surfaces and APIs."""
+    safe_limit = max(1, min(int(limit or 100), 500))
+    clauses: list[str] = []
+    params: list[Any] = []
+    if draft_id:
+        clauses.append("draft_id = ?")
+        params.append(str(draft_id))
+    if batch_id:
+        clauses.append("batch_id = ?")
+        params.append(str(batch_id))
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(safe_limit)
+    with readonly_database_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM draft_review_event {where_sql} ORDER BY created_at DESC, event_id DESC LIMIT ?",
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_import_report_items(
@@ -1103,9 +1416,9 @@ def _review_status_after_draft_edit(draft: dict[str, Any], validation: dict[str,
     warnings = validation.get("warnings") or []
     if errors:
         return "blocked", "；".join(str(item) for item in errors)
+    if current_status in {"ready", "approved"}:
+        return "needs_review", "内容已修改，需要重新进行人工二次审核"
     if current_status in {"blocked", "rejected"}:
-        return "needs_review", "；".join(str(item) for item in warnings)
-    if current_status in {"ready", "approved"} and warnings:
         return "needs_review", "；".join(str(item) for item in warnings)
     if warnings and not current_reason:
         return current_status, "；".join(str(item) for item in warnings)
@@ -1170,6 +1483,25 @@ def update_draft_question_fields(
                 WHERE draft_id = ?
                 """,
                 [candidate.get(column) for column in update_columns] + [safe_draft_id],
+            )
+            persisted = _get_draft_question_from_conn(conn, safe_draft_id)
+            content_hash = _draft_content_hash_from_conn(conn, persisted)
+            _clear_draft_approval_conn(conn, safe_draft_id)
+            conn.execute(
+                "UPDATE question_import_draft SET content_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE draft_id = ?",
+                (content_hash, safe_draft_id),
+            )
+            _record_draft_review_event_conn(
+                conn,
+                persisted,
+                stage="content_edit",
+                from_status=str(draft.get("review_status") or ""),
+                to_status=str(candidate.get("review_status") or "needs_review"),
+                decision="edit",
+                content_hash=content_hash,
+                operator=operator,
+                reason=str(candidate.get("review_reason") or "内容修改后需要重新审核"),
+                detail={"changed_fields": changed_fields},
             )
         return {
             "draft_id": safe_draft_id,
@@ -1298,7 +1630,7 @@ def add_draft_asset(
                 payload["extra_json"],
             ),
         )
-        conn.execute("UPDATE question_import_draft SET updated_at = CURRENT_TIMESTAMP WHERE draft_id = ?", (safe_draft_id,))
+        _refresh_draft_after_related_change_conn(conn, safe_draft_id, operator="asset_service")
         return {
             "draft_id": safe_draft_id,
             "draft_asset_id": draft_asset_id,
@@ -1365,6 +1697,7 @@ def update_draft_asset_fields(
                 "UPDATE question_import_draft SET updated_at = CURRENT_TIMESTAMP WHERE draft_id = ?",
                 (asset.get("draft_id"),),
             )
+            _refresh_draft_after_related_change_conn(conn, str(asset.get("draft_id") or ""), operator="asset_service")
         return {
             "draft_id": str(asset.get("draft_id") or ""),
             "draft_asset_id": safe_asset_id,
@@ -1388,6 +1721,7 @@ def delete_draft_asset(db_path: str | None, draft_asset_id: str) -> dict[str, An
             "UPDATE question_import_draft SET updated_at = CURRENT_TIMESTAMP WHERE draft_id = ?",
             (asset.get("draft_id"),),
         )
+        _refresh_draft_after_related_change_conn(conn, str(asset.get("draft_id") or ""), operator="asset_service")
         return {
             "draft_id": str(asset.get("draft_id") or ""),
             "draft_asset_id": safe_asset_id,
@@ -1526,6 +1860,77 @@ def _upsert_legacy_map_from_draft_conn(conn, question_id: str, question: dict[st
         ),
     )
     return legacy_file_path
+
+
+def _upsert_manual_equivalence_from_draft_conn(
+    conn,
+    question_id: str,
+    draft: dict[str, Any],
+) -> list[str]:
+    """Persist relations selected during entry after the formal ID exists."""
+    candidates = _draft_extra(draft).get("manual_equivalence_candidates") or []
+    if not isinstance(candidates, list):
+        return []
+    written: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        other_id = str(candidate.get("question_id") or "").strip()
+        if not other_id or other_id == question_id:
+            continue
+        relation_type = str(candidate.get("relation_type") or "similar_question").strip()
+        if relation_type not in {"same_question", "similar_question", "variant"}:
+            continue
+        if not conn.execute(
+            "SELECT 1 FROM question WHERE question_id = ?", (other_id,)
+        ).fetchone():
+            continue
+        left, right = sorted([question_id, other_id])
+        equivalence_id = "QE" + hashlib.sha1(
+            f"{left}\u241f{right}\u241f{relation_type}".encode("utf-8")
+        ).hexdigest()[:14]
+        confidence = candidate.get("confidence")
+        try:
+            confidence = None if confidence in (None, "") else max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence = None
+        note = str(candidate.get("note") or "录入页面人工勾选的相似题关系").strip()
+        previous = conn.execute(
+            "SELECT review_status, relation_type, relation_source FROM question_equivalence "
+            "WHERE question_id_a = ? AND question_id_b = ? AND relation_type = ?",
+            (left, right, relation_type),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO question_equivalence(
+                equivalence_id, question_id_a, question_id_b, relation_type,
+                confidence, review_status, note, relation_source, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'approved', ?, 'draft_import', CURRENT_TIMESTAMP)
+            ON CONFLICT(question_id_a, question_id_b, relation_type)
+            DO UPDATE SET confidence = excluded.confidence,
+                          review_status = excluded.review_status,
+                          note = excluded.note,
+                          relation_source = excluded.relation_source,
+                          updated_at = CURRENT_TIMESTAMP
+            """,
+            (equivalence_id, left, right, relation_type, confidence, note),
+        )
+        record_equivalence_event_from_conn(
+            conn,
+            equivalence_id,
+            action="created" if previous is None else "updated",
+            before_status=str(previous["review_status"] if previous else ""),
+            after_status="approved",
+            before_relation_type=relation_type,
+            after_relation_type=relation_type,
+            relation_source="draft_import",
+            operator="draft_commit",
+            note=note,
+            detail={"question_id_a": left, "question_id_b": right, "draft_id": draft.get("draft_id") or ""},
+        )
+        written.append(equivalence_id)
+    return written
 
 
 def _upsert_paper_link_from_draft_conn(conn, question_id: str, draft: dict[str, Any]) -> str:
@@ -1826,6 +2231,7 @@ def _link_draft_to_existing_question_conn(conn, draft: dict[str, Any], question_
     paper_link_id = _upsert_paper_link_from_draft_conn(conn, safe_question_id, draft)
     book_link_id = _upsert_book_link_from_draft_conn(conn, safe_question_id, draft)
     topic_link_id = _upsert_topic_link_from_draft_conn(conn, safe_question_id, draft)
+    equivalence_ids = _upsert_manual_equivalence_from_draft_conn(conn, safe_question_id, draft)
     after = _question_snapshot_from_conn(conn, safe_question_id)
     revision_id = insert_question_revision_from_conn(
         conn,
@@ -1849,9 +2255,9 @@ def _link_draft_to_existing_question_conn(conn, draft: dict[str, Any], question_
         safe_question_id,
         "linked",
         f"复用已有题目 {safe_question_id}",
-        compact_json({"draft_id": draft.get("draft_id"), "question_id": safe_question_id, "paper_link_id": paper_link_id, "book_link_id": book_link_id, "topic_link_id": topic_link_id}),
+        compact_json({"draft_id": draft.get("draft_id"), "question_id": safe_question_id, "paper_link_id": paper_link_id, "book_link_id": book_link_id, "topic_link_id": topic_link_id, "equivalence_ids": equivalence_ids}),
     )
-    return {"draft_id": draft.get("draft_id"), "status": "linked", "question_id": safe_question_id, "revision_id": revision_id, "report_id": report_id, "source_link_id": paper_link_id, "book_link_id": book_link_id, "topic_link_id": topic_link_id}
+    return {"draft_id": draft.get("draft_id"), "status": "linked", "question_id": safe_question_id, "revision_id": revision_id, "report_id": report_id, "source_link_id": paper_link_id, "book_link_id": book_link_id, "topic_link_id": topic_link_id, "equivalence_ids": equivalence_ids}
 
 
 def link_draft_to_existing_question(
@@ -1895,14 +2301,18 @@ def record_draft_review_event(
         draft = _get_draft_question_from_conn(conn, safe_draft_id)
         if not draft:
             raise KeyError(f"draft not found: {safe_draft_id}")
+        previous_status = str(draft.get("review_status") or "")
+        current_hash = _draft_content_hash_from_conn(conn, draft)
         with conn:
             conn.execute(
                 """
                 UPDATE question_import_draft
-                SET review_status = ?, review_reason = ?, updated_at = CURRENT_TIMESTAMP
+                SET review_status = ?, review_reason = ?, content_hash = ?,
+                    approved_content_hash = '', approved_by = '', approved_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE draft_id = ?
                 """,
-                (status, reason, safe_draft_id),
+                (status, reason, current_hash, safe_draft_id),
             )
             report_status = "linked" if status == "linked" else "skipped" if status == "rejected" else status
             report_id = _insert_report_item_from_conn(
@@ -1922,7 +2332,21 @@ def record_draft_review_event(
                     "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }),
             )
-        return {"draft_id": safe_draft_id, "status": status, "report_id": report_id}
+            updated = dict(draft)
+            updated.update({"review_status": status, "review_reason": reason, "content_hash": current_hash})
+            event_id = _record_draft_review_event_conn(
+                conn,
+                updated,
+                stage="human_review",
+                from_status=previous_status,
+                to_status=status,
+                decision=status,
+                content_hash=current_hash,
+                operator=operator,
+                reason=reason,
+                detail={"existing_question_id": str(existing_question_id or "")},
+            )
+        return {"draft_id": safe_draft_id, "status": status, "report_id": report_id, "event_id": event_id}
 
 
 def _insert_report_item_from_conn(
@@ -1971,8 +2395,12 @@ def commit_draft_to_question(
         if not draft:
             raise KeyError(f"草稿不存在：{safe_draft_id}")
         review_status = str(draft.get("review_status") or "")
-        if require_ready and review_status not in {"ready", "approved"}:
-            raise ValueError(f"草稿状态必须是 ready/approved，当前为：{review_status}")
+        current_hash = _draft_content_hash_from_conn(conn, draft)
+        approved_hash = str(draft.get("approved_content_hash") or "")
+        if review_status != "approved":
+            raise ValueError(f"草稿必须经过人工二次审核并为 approved，当前为：{review_status}")
+        if not approved_hash or approved_hash != current_hash:
+            raise ValueError("草稿内容已变化或尚未完成二次审核，请重新审核后再入库")
         validation = validate_draft_question(_draft_row_to_input(draft))
         if require_ready and validation.get("status") != "ready":
             detail_parts = []
@@ -2035,6 +2463,7 @@ def commit_draft_to_question(
             paper_question_id = _upsert_paper_link_from_draft_conn(conn, question_id, draft)
             book_link_id = _upsert_book_link_from_draft_conn(conn, question_id, draft)
             topic_link_id = _upsert_topic_link_from_draft_conn(conn, question_id, draft)
+            equivalence_ids = _upsert_manual_equivalence_from_draft_conn(conn, question_id, draft)
             asset_result = _copy_draft_assets_to_question_conn(conn, draft, question_id, copy_files=copy_assets)
             revision_id = insert_question_revision_from_conn(
                 conn,
@@ -2070,6 +2499,7 @@ def commit_draft_to_question(
                         "paper_question_id": paper_question_id,
                         "book_link_id": book_link_id,
                         "topic_link_id": topic_link_id,
+                        "equivalence_ids": equivalence_ids,
                         "assets": asset_result,
                     }
                 ),
@@ -2086,6 +2516,7 @@ def commit_draft_to_question(
         "source_link_id": paper_question_id,
         "book_link_id": book_link_id,
         "topic_link_id": topic_link_id,
+        "equivalence_ids": equivalence_ids,
         "legacy_file_path": legacy_file_path,
         "report_id": report_id,
         "message": f"草稿已提交为正式题：{question_id}",
@@ -2103,6 +2534,11 @@ def _commit_draft_to_question_conn(
 ) -> dict[str, Any]:
     """Commit a validated draft using the caller's transaction."""
     safe_draft_id = str(draft.get("draft_id") or "").strip()
+    current_hash = _draft_content_hash_from_conn(conn, draft)
+    if str(draft.get("review_status") or "") != "approved":
+        raise ValueError("草稿必须经过人工二次审核并为 approved")
+    if not str(draft.get("approved_content_hash") or "") or str(draft.get("approved_content_hash") or "") != current_hash:
+        raise ValueError("草稿内容已变化或尚未完成二次审核，请重新审核")
     proposed_action = str(draft.get("proposed_action") or "insert").strip()
     reuse_question_id = str(draft.get("_reuse_question_id") or "").strip()
     if reuse_question_id and proposed_action == "insert":
@@ -2142,6 +2578,7 @@ def _commit_draft_to_question_conn(
     paper_question_id = _upsert_paper_link_from_draft_conn(conn, question_id, draft)
     book_link_id = _upsert_book_link_from_draft_conn(conn, question_id, draft)
     topic_link_id = _upsert_topic_link_from_draft_conn(conn, question_id, draft)
+    equivalence_ids = _upsert_manual_equivalence_from_draft_conn(conn, question_id, draft)
     asset_result = _copy_draft_assets_to_question_conn(
         conn, draft, question_id, copy_files=copy_assets, created_paths=created_asset_paths
     )
@@ -2161,7 +2598,7 @@ def _commit_draft_to_question_conn(
     report_id = _insert_report_item_from_conn(
         conn, str(draft.get("batch_id") or ""), report_index, safe_draft_id,
         question_id, "committed", f"{proposed_action} -> {question_id}",
-        compact_json({"draft_id": safe_draft_id, "question_id": question_id, "revision_id": revision_id, "assets": asset_result, "book_link_id": book_link_id, "topic_link_id": topic_link_id}),
+        compact_json({"draft_id": safe_draft_id, "question_id": question_id, "revision_id": revision_id, "assets": asset_result, "book_link_id": book_link_id, "topic_link_id": topic_link_id, "equivalence_ids": equivalence_ids}),
     )
     return {
         "draft_id": safe_draft_id,
@@ -2174,6 +2611,7 @@ def _commit_draft_to_question_conn(
         "source_link_id": paper_question_id,
         "book_link_id": book_link_id,
         "topic_link_id": topic_link_id,
+        "equivalence_ids": equivalence_ids,
         "legacy_file_path": legacy_file_path,
         "report_id": report_id,
         "message": f"草稿已提交为正式题：{question_id}",
@@ -2185,7 +2623,7 @@ def commit_drafts_to_questions(
     draft_ids: list[str],
     *,
     operator: str = "streamlit_batch_import",
-    require_ready: bool = False,
+    require_ready: bool = True,
     copy_assets: bool = True,
 ) -> dict[str, Any]:
     """Preflight and commit a group of drafts in one transaction."""
@@ -2208,8 +2646,13 @@ def commit_drafts_to_questions(
             if status == "committed":
                 validation_errors.append({"draft_id": draft_id, "index": index, "errors": ["草稿已经提交过"]})
                 continue
-            if require_ready and status not in {"ready", "approved"}:
-                validation_errors.append({"draft_id": draft_id, "index": index, "errors": [f"草稿状态必须是 ready/approved，当前为：{status}"]})
+            current_hash = _draft_content_hash_from_conn(conn, draft)
+            approved_hash = str(draft.get("approved_content_hash") or "")
+            if status != "approved":
+                validation_errors.append({"draft_id": draft_id, "index": index, "errors": [f"草稿必须经过人工二次审核并为 approved，当前为：{status}"]})
+                continue
+            if not approved_hash or approved_hash != current_hash:
+                validation_errors.append({"draft_id": draft_id, "index": index, "errors": ["草稿内容已变化或尚未完成二次审核，请重新审核"]})
                 continue
             validation = validate_draft_question(_draft_row_to_input(draft))
             if validation.get("errors"):

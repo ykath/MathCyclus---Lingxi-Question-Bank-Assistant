@@ -13,7 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.image_region_service import crop_visual_regions, detect_visual_regions, opencv_available
+from services.image_region_service import (
+    crop_visual_regions,
+    detect_visual_regions,
+    normalize_region_bbox,
+    opencv_available,
+    recrop_visual_region,
+)
 
 
 def main() -> int:
@@ -31,13 +37,17 @@ def main() -> int:
             root / "crops",
             name_prefix="page_001_region",
         )
+        edge_crop = recrop_visual_region(source, [-30, -20, 160, 190], root / "edge.png", margin=18)
         checks = {
             "crop_created": len(explicit) == 1 and Path(explicit[0]["source_path"]).is_file(),
             "crop_margin_applied": explicit[0]["crop_bbox"] == [168, 208, 442, 482],
+            "edge_crop_clamped": edge_crop["crop_bbox"] == [0, 0, 178, 208],
+            "invalid_bbox_rejected": normalize_region_bbox([0, 0, 1, 1], 600, 800) == [],
         }
         if opencv_available():
             detected = detect_visual_regions(source)
             checks["opencv_region_detected"] = bool(detected)
+            checks["quality_metadata_present"] = bool(detected and "quality_score" in detected[0])
     for name, ok in checks.items():
         print(f"{name}={'ok' if ok else 'failed'}")
     print(f"opencv_available={opencv_available()}")

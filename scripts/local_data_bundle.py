@@ -102,6 +102,38 @@ def bytes_sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def database_schema_version(path: Path) -> int:
+    """Read the schema version without importing the application's database layer."""
+    if not path.is_file():
+        return 0
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        finally:
+            conn.close()
+        raw = str(row[0] if row else "").strip()
+        return int(raw) if raw.isdigit() else 0
+    except (OSError, sqlite3.Error, ValueError):
+        return 0
+
+
+def supported_schema_version(project_root: Path) -> int:
+    """Return the highest migration shipped with this source checkout."""
+    migrations_dir = project_root / "db" / "migrations"
+    versions = []
+    for path in migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"):
+        try:
+            versions.append(int(path.name[:4]))
+        except ValueError:
+            continue
+    if versions:
+        return max(versions)
+    return database_schema_version(project_root / "db" / "schema.sql")
+
+
 def iter_files(path: Path) -> Iterable[Path]:
     if path.is_file():
         yield path
@@ -168,6 +200,8 @@ def make_manifest(
     include_legacy_tex: bool,
     include_reports: bool,
     include_exports: bool,
+    schema_version: int,
+    supported_version: int,
 ) -> dict[str, Any]:
     counts_by_kind: dict[str, int] = {}
     bytes_by_kind: dict[str, int] = {}
@@ -182,6 +216,8 @@ def make_manifest(
         "output": relative_to_root(output_path, project_root),
         "contains_personal_data": True,
         "intended_for_git": False,
+        "schema_version": int(schema_version or 0),
+        "supported_schema_version_at_export": int(supported_version or 0),
         "include_legacy_tex": include_legacy_tex,
         "include_reports": include_reports,
         "include_exports": include_exports,
@@ -225,6 +261,9 @@ def export_bundle(
     )
     output_relative = relative_to_root(output_path, root)
     items = [item for item in items if item.relative_path != output_relative]
+    database_path = root / "data" / "mathcyclus.sqlite3"
+    schema_version = database_schema_version(database_path)
+    supported_version = supported_schema_version(root)
     manifest = make_manifest(
         root,
         output_path,
@@ -233,6 +272,8 @@ def export_bundle(
         include_legacy_tex=include_legacy_tex,
         include_reports=include_reports,
         include_exports=include_exports,
+        schema_version=schema_version,
+        supported_version=supported_version,
     )
 
     if not dry_run:
@@ -306,6 +347,8 @@ def inspect_bundle(bundle_path: str | Path) -> dict[str, Any]:
         "counts_by_kind": manifest.get("counts_by_kind", {}),
         "contains_personal_data": manifest.get("contains_personal_data", True),
         "intended_for_git": manifest.get("intended_for_git", False),
+        "schema_version": manifest.get("schema_version", 0),
+        "supported_schema_version_at_export": manifest.get("supported_schema_version_at_export", 0),
     }
 
 
@@ -339,6 +382,14 @@ def restore_bundle(
             raise ValueError(f"迁移包缺少清单：{MANIFEST_NAME}")
 
         manifest = read_manifest(bundle_path)
+        bundle_schema_version = int(manifest.get("schema_version") or 0)
+        supported_version = supported_schema_version(root)
+        if bundle_schema_version > supported_version:
+            blocked.append(
+                f"迁移包 schema version {bundle_schema_version} 高于当前程序支持的 {supported_version}，请先更新程序。"
+            )
+        target_database = root / "data" / "mathcyclus.sqlite3"
+        target_schema_version = database_schema_version(target_database)
         manifest_items = {
             safe_zip_relative_path(str(item.get("path") or "")): item
             for item in manifest.get("items", [])
@@ -437,6 +488,12 @@ def restore_bundle(
         "blocked": blocked[:80],
         "overwrite": overwrite,
         "database_backup": database_backup,
+        "bundle_schema_version": bundle_schema_version,
+        "target_schema_version": target_schema_version,
+        "supported_schema_version": supported_version,
+        "migration_needed_after_restore": bool(
+            not blocked and bundle_schema_version < supported_version
+        ),
         "deletes_files": False,
     }
 
@@ -450,6 +507,7 @@ def print_summary(report: dict[str, Any], *, command: str) -> None:
         print(f"total_bytes={report.get('total_bytes')}")
         print(f"contains_personal_data={report.get('contains_personal_data')}")
         print(f"intended_for_git={report.get('intended_for_git')}")
+        print(f"schema_version={report.get('schema_version')}")
         print(f"bundle_size={report.get('bundle_size')}")
     elif command == "inspect":
         print(f"bundle={report.get('bundle')}")
@@ -458,12 +516,15 @@ def print_summary(report: dict[str, Any], *, command: str) -> None:
         print(f"counts_by_kind={json.dumps(report.get('counts_by_kind', {}), ensure_ascii=False)}")
         print(f"contains_personal_data={report.get('contains_personal_data')}")
         print(f"intended_for_git={report.get('intended_for_git')}")
+        print(f"schema_version={report.get('schema_version')}")
     elif command == "restore":
         print(f"dry_run={report.get('dry_run')}")
         print(f"restored_count={report.get('restored_count')}")
         print(f"conflict_count={report.get('conflict_count')}")
         print(f"skipped_count={report.get('skipped_count')}")
         print(f"blocked_count={report.get('blocked_count')}")
+        print(f"bundle_schema_version={report.get('bundle_schema_version')}")
+        print(f"supported_schema_version={report.get('supported_schema_version')}")
         if report.get("conflicts"):
             print("conflicts=" + ",".join(report["conflicts"]))
 

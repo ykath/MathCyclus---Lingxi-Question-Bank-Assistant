@@ -52,8 +52,14 @@ def main() -> None:
     close_result = combined_similarity_score(reference, structurally_close, 0.8)
     chapter_result = combined_similarity_score(reference, same_chapter_only, 0.8)
     unrelated_result = combined_similarity_score(reference, unrelated, 0.8)
+    exact_result = combined_similarity_score(reference, reference, 0.8)
 
     assert close_result["score"] > chapter_result["score"] > unrelated_result["score"]
+    assert exact_result["relationship_kind"] == "same_question"
+    assert exact_result["relationship_eligible"] is True
+    assert close_result["relationship_eligible"] is False
+    assert chapter_result["relationship_eligible"] is False
+    assert unrelated_result["relationship_eligible"] is False
     assert "公式结构接近" in close_result["reason"]
     assert "题干表述接近" not in unrelated_result["reason"]
     assert all(0.0 <= result["score"] <= 1.0 for result in [close_result, chapter_result, unrelated_result])

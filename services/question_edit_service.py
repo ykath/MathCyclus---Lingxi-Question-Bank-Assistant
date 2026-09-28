@@ -8,7 +8,6 @@ from typing import Any
 from services.database_service import existing_database_connection, row_to_dict
 from services.revision_service import (
     TRACKED_QUESTION_FIELDS,
-    changed_fields,
     compact_json,
     insert_question_revision_from_conn,
 )

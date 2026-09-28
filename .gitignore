@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+.mathcyclus_api_token
+
+# 本地参考算法文档，不上传 GitHub
+GaokaoWeb相似度计算口径.md
 
 # Agent Mail 授权过程中的本地临时日志
 .agently-auth/
@@ -60,6 +64,15 @@ data/imports/*
 !data/imports/pdf_jobs/
 data/imports/pdf_jobs/*
 !data/imports/pdf_jobs/.gitkeep
+
+# AI 题目数据工厂的本地上传、分片和解析缓存（运行时生成，不上传）
+data/uploads/
+data/asset_cache/
+*.part
+*.tmp
+*.bak
+*.orig
+*.rej
 db/seed/*
 !db/seed/.gitkeep
 reports/*

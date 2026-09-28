@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .file_service import atomic_write_text
@@ -81,4 +80,3 @@ def save_prompt(name: str, value: str) -> None:
 
 def prompt_values() -> dict[str, str]:
     return {name: load_prompt(name) for name in PROMPT_FILES}
-

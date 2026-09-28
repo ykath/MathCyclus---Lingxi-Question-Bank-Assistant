@@ -5,6 +5,7 @@
 
 ## 主文档
 
+- `../ai/README.md`：AI、队友和自动化工具的任务路由与当前硬规则入口。
 - `题库数据库重构实施规划.md`：数据库重构主规划与阶段执行记录。
 - `题库重构参考沉淀.md`：外部题库系统、AI 录入方式和数据库设计参考。
 - `unfinished_tasks.md`：当前未完成事项、优先级和下一步入口。
@@ -18,6 +19,7 @@
 - `paper_catalog_and_ingestion_flow.md`：卷目录主表、别名表和录入确认流程草案。
 - `local_workspace_and_migration.md`：本地工作区初始化、迁移包和私有数据边界。
 - `release_file_checklist.md`：发布前文件白名单、黑名单和私有数据检查。
+- `maintenance_script_catalog.md`：维护、审计、smoke、迁移和一次性清洗脚本的职责边界。
 - `version_update_and_installer.md`：版本更新、启动器和安装包边界。
 - `schema_migration_flow.md`：SQLite schema 迁移流程。
 - `sqlite_promotion_flow.md`：预览库提升为正式库流程。
@@ -26,8 +28,8 @@
 
 ## 当前推进顺序
 
-1. P0 稳定性复核已完成：2026-09-11 发布前检查 `failed=0`，保留两项非阻断 warning。
-2. PDF 导入 P0-P3 可用首版已完成；下一步补页面区域裁剪、题内图片命名与排序的 P3.1。
+1. P0 稳定性复核已完成：2026-09-24 快速发布前检查 `failed=0`，保留工作区未提交改动这一项非阻断 warning。
+2. PDF 导入 P0-P3.1 可用首版已完成；下一步只补复杂扫描页的可选 OpenCV 增强和更细的人工裁剪能力。
 3. P2 继续补强题目、试卷、教材、专题、图片资源、修订记录之间的双向关系。
 4. P2 数据清洗已进入来源命名阶段：先用只读审计报告确认试卷标准名、文理 track 和重复题治理策略，再批量写库。
 5. P3 继续完善白名单源码包、更新助手、迁移包和未来安装包边界。

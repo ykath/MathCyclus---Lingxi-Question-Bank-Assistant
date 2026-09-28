@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import uuid
@@ -33,7 +34,7 @@ EDITABLE_CANDIDATE_FIELDS = {
     "note",
     "official_flag",
 }
-REVIEW_STATUSES = {"needs_review", "ready", "blocked", "rejected"}
+REVIEW_STATUSES = {"needs_review", "ready", "approved", "blocked", "rejected"}
 QUESTION_START_PATTERN = re.compile(
     r"^\s*(?:第\s*)?([1-9]\d{0,2})\s*(?:题\s*[:：、.．]?|[、.．])\s*(.*)$"
 )
@@ -97,6 +98,15 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _ocr_prompt_metadata() -> dict[str, str]:
+    prompt_path = PROJECT_ROOT / "ocr_prompt.txt"
+    return {
+        "file": "ocr_prompt.txt",
+        "sha256": file_sha256(prompt_path) if prompt_path.is_file() else "",
+        "available": "true" if prompt_path.is_file() else "false",
+    }
 
 
 def validate_job_id(job_id: str) -> str:
@@ -606,12 +616,15 @@ def update_pdf_question_candidate(
             normalized_updates["difficulty"] = difficulty
 
     candidate.update(normalized_updates)
+    if previous_status == "approved" and set(normalized_updates) - {"review_status", "review_reason"}:
+        candidate["review_status"] = "needs_review"
+        candidate["review_reason"] = "内容已修改，需要重新进行人工二次审核"
     validation = validate_question_candidate(candidate)
-    if candidate.get("review_status") == "ready" and (validation["errors"] or validation["warnings"]):
-        issues = validation["errors"] + validation["warnings"]
+    if candidate.get("review_status") in {"ready", "approved"} and validation["errors"]:
+        issues = validation["errors"]
         raise ValueError("标记 ready 前需要处理：" + "；".join(issues))
     candidate["validation"] = {
-        "status": "blocked" if validation["errors"] else "needs_review" if validation["warnings"] else "ready",
+        "status": "blocked" if validation["errors"] else "ready",
         **validation,
     }
     _append_pdf_import_event(
@@ -680,6 +693,9 @@ def update_pdf_question_asset_crop(
         "review_status": "ready",
         "note": "人工调整裁剪框后生成。",
     })
+    if candidate.get("review_status") == "approved":
+        candidate["review_status"] = "needs_review"
+        candidate["review_reason"] = "图片裁剪已修改，需要重新进行人工二次审核"
     _append_pdf_import_event(payload, source_item_id, "crop_updated", message=f"asset_index={int(asset_index)}")
     _save_pdf_import_state(job_dir, manifest, payload)
     return {"job_id": job_id, "source_item_id": source_item_id, "asset_index": int(asset_index), "asset": asset}
@@ -728,6 +744,9 @@ def merge_pdf_question_assets(
     first = selected_indexes[0]
     candidate["assets"] = [asset for index, asset in enumerate(assets) if index not in selected_indexes or index == first]
     candidate["assets"][next(index for index, asset in enumerate(candidate["assets"]) if asset is assets[first])] = merged_asset
+    if candidate.get("review_status") == "approved":
+        candidate["review_status"] = "needs_review"
+        candidate["review_reason"] = "图片资源已合并，需要重新进行人工二次审核"
     _append_pdf_import_event(payload, source_item_id, "assets_merged", message=f"merged_count={len(selected)}")
     _save_pdf_import_state(job_dir, manifest, payload)
     return {"job_id": job_id, "source_item_id": source_item_id, "asset": merged_asset, "merged_count": len(selected)}
@@ -754,7 +773,7 @@ def bulk_mark_pdf_candidates_ready(
             "status": "blocked" if validation["errors"] else "needs_review" if validation["warnings"] else "ready",
             **validation,
         }
-        if validation["errors"] or validation["warnings"]:
+        if validation["errors"]:
             skipped.append(
                 {
                     "source_item_id": str(candidate.get("source_item_id") or ""),
@@ -860,11 +879,14 @@ def commit_pdf_import_candidates(
             if source_path and not Path(source_path).is_absolute():
                 asset["source_path"] = str((job_dir / source_path).resolve())
             draft_assets.append(asset)
+        if str(candidate.get("review_status") or "") != "approved":
+            failed.append({"source_item_id": source_item_id, "error": "PDF 候选必须经过人工二次审核并标记为 approved"})
+            continue
         draft_payload = {
             "source_item_id": source_item_id,
             "source_label": candidate.get("source_label") or source_item_id,
             "proposed_action": "insert",
-            "review_status": "ready",
+            "review_status": "approved",
             "question_type_id": candidate.get("question_type_id"),
             "stem_tex": candidate.get("stem_tex") or "",
             "choices": candidate.get("choices") or [],
@@ -883,11 +905,17 @@ def commit_pdf_import_candidates(
                 draft_payload,
                 source_path=f"pdf-import/{job_id}",
             )
+            from services.import_service import approve_draft_for_commit
+            approve_draft_for_commit(
+                str(db_path),
+                draft_result["draft_id"],
+                operator=operator,
+                note="PDF 候选已完成人工二次审核",
+            )
             commit_result = commit_draft_to_question(
                 str(db_path),
                 draft_result["draft_id"],
                 operator=operator,
-                require_ready=False,
             )
             candidate["commit_status"] = "committed"
             candidate["draft_id"] = draft_result["draft_id"]
@@ -1254,6 +1282,8 @@ def create_pdf_import_job(
     render_dpi: int = 144,
     original_name: str | None = None,
     parser_mode: str = "auto",
+    pipeline_code: str = "math_exam_hybrid",
+    ai_mode: str = "page_gpt",
 ) -> dict[str, Any]:
     source_path = Path(source_pdf).resolve()
     if not source_path.is_file():
@@ -1281,6 +1311,19 @@ def create_pdf_import_job(
     pages_dir.mkdir(parents=True)
     copied_pdf = job_dir / "source.pdf"
     shutil.copy2(source_path, copied_pdf)
+    asset_sha256 = file_sha256(copied_pdf)
+    asset_id = f"asset_{asset_sha256[:16]}"
+    pipeline_config = {
+        "code": str(pipeline_code or "math_exam_hybrid"),
+        "ai_mode": str(ai_mode or "page_gpt"),
+        "recognizer_version": "page_v1",
+        "steps": [
+            {"type": "document_parser", "mode": str(parser_mode or "auto")},
+            {"type": "page_asset_crop", "mode": "local"},
+            {"type": "question_draft", "mode": str(ai_mode or "page_gpt")},
+            {"type": "human_review", "mode": "required"},
+        ],
+    }
     created_at = utc_now()
     manifest_path = job_dir / "job_manifest.json"
     draft_path = job_dir / "draft_payload.json"
@@ -1292,12 +1335,24 @@ def create_pdf_import_job(
         "created_at": created_at,
         "updated_at": created_at,
         "source": {
+            "asset_id": asset_id,
             "original_name": Path(original_name).name if original_name else source_path.name,
             "copied_path": "source.pdf",
             "size_bytes": copied_pdf.stat().st_size,
-            "sha256": file_sha256(copied_pdf),
+            "sha256": asset_sha256,
             "source_type": source_type,
             "metadata": normalized_metadata,
+        },
+        "pipeline": pipeline_config,
+        "provenance": {
+            "input_sha256": asset_sha256,
+            "parser_requested": str(parser_mode or "auto"),
+            "ai": {
+                "mode": str(ai_mode or "page_gpt"),
+                "model_name": os.getenv("AI_MODEL_NAME", "").strip(),
+                "prompt": _ocr_prompt_metadata(),
+                "recognizer_version": "page_v1",
+            },
         },
         "parser": {
             "name": "pending",
@@ -1341,6 +1396,8 @@ def create_pdf_import_job(
         cloud_overrides: dict[int, dict[str, Any]] = {}
         if parser_result.get("parser") == "mineru_cloud":
             result_dirs = [item.get("output_dir") for item in parser_result.get("downloads") or []]
+            if parser_result.get("output_dir"):
+                result_dirs.append(parser_result.get("output_dir"))
             content_root = next((Path(str(value)) for value in result_dirs if value and (Path(str(value)) / "content_list.json").exists()), None)
             if content_root is None:
                 candidates = [Path(str(value)) for value in result_dirs if value]
@@ -1461,6 +1518,9 @@ def create_pdf_import_job(
             "summary": f"PDF heuristic split; pages={len(pages)}; candidates={len(question_drafts)}",
             "source_type": source_type,
             "source_metadata": normalized_metadata,
+            "asset": manifest["source"],
+            "pipeline": pipeline_config,
+            "provenance": manifest["provenance"],
             "pages": pages,
             "questions": question_drafts,
             "unassigned_blocks": unassigned_blocks,
@@ -1511,5 +1571,7 @@ def create_pdf_import_job(
         "import_report_path": str(report_path),
         "page_count": len(pages),
         "question_candidate_count": len(question_drafts),
+        "asset_id": asset_id,
+        "pipeline": pipeline_config,
         "writes_formal_database": False,
     }

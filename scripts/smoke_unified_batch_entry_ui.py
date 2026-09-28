@@ -45,9 +45,9 @@ def main() -> int:
         default_timeout=30,
     ).run()
     checks = {"initial_render": not app.exception}
-    mode_radio = next(item for item in app.radio if item.label == "录入方式")
     for mode in ["批量试题录入", "同卷试题录入", "同书试题录入"]:
-        mode_radio.set_value(mode)
+        mode_button = next(item for item in app.button if item.label == mode)
+        mode_button.click()
         app.run(timeout=30)
         batch_tex = next(item for item in app.text_area if item.label == "批量 TeX 内容")
         batch_tex.set_value(SAMPLE_TEX)
@@ -61,7 +61,10 @@ def main() -> int:
         checks[f"{mode}_per_question_metadata"] = type_count == 2
         checks[f"{mode}_topic_dropdowns"] = topic_count == 2
         checks[f"{mode}_compact_note_fields"] = note_count == 2
-        checks[f"{mode}_direct_import_button"] = "录入其余未处理题" in [item.label for item in app.button]
+        checks[f"{mode}_bulk_import_actions"] = all(
+            label in [item.label for item in app.button]
+            for label in ["录入所有未处理问题", "录入所有非重复问题", "录入所有非重复与相似问题"]
+        )
         checks[f"{mode}_single_import_actions"] = (
             "单独录入本题" in [item.label for item in app.button]
             and "确认不录入" in [item.label for item in app.button]
@@ -69,7 +72,6 @@ def main() -> int:
         checks[f"{mode}_review_workspace_hidden"] = "草稿审核与确认入库" not in [item.value for item in app.subheader]
         if mode == "同书试题录入":
             checks["same_book_per_question_pages"] = len([item for item in app.text_input if item.label == "页码"]) == 2
-        mode_radio = next(item for item in app.radio if item.label == "录入方式")
     checks["formal_database_unchanged"] = sha256(FORMAL_DB) == before
     for name, ok in checks.items():
         print(f"{name}={'ok' if ok else 'failed'}")

@@ -13,14 +13,21 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.database_service import readonly_database_connection
-from services.import_service import commit_draft_to_question, commit_drafts_to_questions, create_manual_entry_drafts
+from services.schema_migration_service import apply_pending_migrations
+from services.import_service import approve_draft_for_commit, commit_draft_to_question, commit_drafts_to_questions, create_manual_entry_drafts
 import services.import_service as import_service_module
+
+
+def approve_created(db_path: str, created: dict) -> None:
+    for item in created.get("results") or []:
+        approve_draft_for_commit(db_path, item["draft_id"], operator="smoke_reviewer")
 
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mathcyclus_batch_commit_smoke_") as temp_dir:
         db_path = Path(temp_dir) / SOURCE_DB.name
         shutil.copy2(SOURCE_DB, db_path)
+        apply_pending_migrations(str(db_path), apply=True, backup=False, allow_external_database=True)
 
         created = create_manual_entry_drafts(
             str(db_path),
@@ -30,6 +37,7 @@ def main() -> int:
             ],
             stamp="smoke_batch_commit_ok",
         )
+        approve_created(str(db_path), created)
         result = commit_drafts_to_questions(str(db_path), [item["draft_id"] for item in created["results"]])
         assert result["status"] == "committed", result
         assert len(result["committed"]) == 2, result
@@ -51,6 +59,7 @@ def main() -> int:
             }],
             stamp="smoke_book_commit",
         )
+        approve_created(str(db_path), book_created)
         book_result = commit_drafts_to_questions(str(db_path), [book_created["results"][0]["draft_id"]])
         assert book_result["status"] == "committed", book_result
         with readonly_database_connection(str(db_path)) as conn:
@@ -80,12 +89,14 @@ def main() -> int:
             [{"source_item_id": "smoke-paper-link-1", "stem_tex": r"$x=1$", "answer_tex": "1", "solution_tex": r"x=1", "review_status": "ready", "extra": paper_extra}],
             stamp="smoke_paper_link_first",
         )
-        first_commit = commit_draft_to_question(str(db_path), paper_first["results"][0]["draft_id"], require_ready=False)
+        approve_created(str(db_path), paper_first)
+        first_commit = commit_draft_to_question(str(db_path), paper_first["results"][0]["draft_id"])
         paper_second = create_manual_entry_drafts(
             str(db_path),
             [{"source_item_id": "smoke-paper-link-2", "stem_tex": r"$x=1$", "answer_tex": "1", "solution_tex": r"x=1", "review_status": "ready", "extra": paper_extra}],
             stamp="smoke_paper_link_second",
         )
+        approve_created(str(db_path), paper_second)
         linked_commit = commit_drafts_to_questions(str(db_path), [paper_second["results"][0]["draft_id"]])
         assert linked_commit["results"][0]["status"] == "linked", linked_commit
         with readonly_database_connection(str(db_path)) as conn:
@@ -115,7 +126,8 @@ def main() -> int:
             }],
             stamp="smoke_topic_link",
         )
-        topic_commit = commit_draft_to_question(str(db_path), topic_created["results"][0]["draft_id"], require_ready=False)
+        approve_created(str(db_path), topic_created)
+        topic_commit = commit_draft_to_question(str(db_path), topic_created["results"][0]["draft_id"])
         with readonly_database_connection(str(db_path)) as conn:
             topic_link_count = conn.execute("SELECT COUNT(*) FROM topic_question WHERE question_id = ?", (topic_commit["question_id"],)).fetchone()[0]
         assert topic_link_count == 1, topic_link_count
@@ -132,6 +144,7 @@ def main() -> int:
             }],
             stamp="smoke_asset_rollback",
         )
+        approve_created(str(db_path), rollback_created)
         original_revision = import_service_module.insert_question_revision_from_conn
         import_service_module.insert_question_revision_from_conn = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("forced smoke failure"))
         try:
@@ -156,6 +169,7 @@ def main() -> int:
             ],
             stamp="smoke_batch_commit_failed",
         )
+        approve_created(str(db_path), {"results": failed_batch.get("results", [])[:1]})
         failed = commit_drafts_to_questions(str(db_path), [item["draft_id"] for item in failed_batch["results"]])
         assert failed["status"] == "blocked", failed
         with readonly_database_connection(str(db_path)) as conn:

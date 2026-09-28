@@ -31,6 +31,8 @@ def main() -> int:
         (target_root / "db").mkdir(parents=True)
         shutil.copy2(PROJECT_ROOT / "db" / "schema.sql", source_root / "db" / "schema.sql")
         shutil.copy2(PROJECT_ROOT / "db" / "schema.sql", target_root / "db" / "schema.sql")
+        shutil.copytree(PROJECT_ROOT / "db" / "migrations", source_root / "db" / "migrations")
+        shutil.copytree(PROJECT_ROOT / "db" / "migrations", target_root / "db" / "migrations")
 
         init_report = ensure_local_workspace(
             project_root=source_root,
@@ -40,7 +42,7 @@ def main() -> int:
         source_db = source_root / "data" / "mathcyclus.sqlite3"
         assert init_report["database"]["status"] == "created", init_report
         assert source_db.exists()
-        assert table_count(source_db, "question_type") == 5
+        assert table_count(source_db, "question_type") == 6
 
         asset_dir = source_root / "assets" / "questions" / "Q000001"
         asset_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +61,8 @@ def main() -> int:
         assert export_report["contains_personal_data"] is True
         assert export_report["intended_for_git"] is False
         assert export_report["counts_by_kind"].get("local_preferences") == 1, export_report
+        assert int(export_report.get("schema_version") or 0) > 0, export_report
+        assert int(export_report.get("supported_schema_version_at_export") or 0) >= int(export_report.get("schema_version") or 0), export_report
 
         inspect_report = inspect_bundle(bundle_path)
         assert inspect_report["status"] == "ok", inspect_report
@@ -68,6 +72,7 @@ def main() -> int:
         assert restore_dry_run["status"] == "ok", restore_dry_run
         assert restore_dry_run["dry_run"] is True
         assert restore_dry_run["restored_count"] == export_report["item_count"]
+        assert restore_dry_run["supported_schema_version"] >= restore_dry_run["bundle_schema_version"], restore_dry_run
         assert not (target_root / "data" / "mathcyclus.sqlite3").exists()
 
         restore_apply = restore_bundle(project_root=target_root, bundle=bundle_path, apply=True)

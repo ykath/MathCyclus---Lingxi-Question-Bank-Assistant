@@ -43,6 +43,9 @@ def main() -> int:
         finish_queue_item("queue_smoke", second["source_item_id"], error="timeout", jobs_root=root / "jobs")
         failed = load_queue("queue_smoke", jobs_root=root / "jobs")
         checks["results_persisted"] = queue_summary(failed)["succeeded"] == 1 and queue_summary(failed)["failed"] == 1
+        failed_item = next(item for item in failed["items"] if item["status"] == "failed")
+        checks["failure_classified"] = failed_item.get("error_category") == "network_timeout" and failed_item.get("retryable") is True
+        checks["heartbeat_persisted"] = bool(failed_item.get("heartbeat_at")) and bool(failed.get("heartbeat_at"))
         retried = retry_failed_items("queue_smoke", jobs_root=root / "jobs")
         checks["failed_retryable"] = queue_summary(retried)["pending"] == 1 and queue_summary(retried)["succeeded"] == 1
         refreshed = create_or_refresh_queue("queue_smoke", jobs_root=root / "jobs")

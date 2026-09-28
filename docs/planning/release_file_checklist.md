@@ -7,6 +7,8 @@
 这些内容属于项目源码或可复现配置，应该随版本发布：
 
 - `question_bank_app.py`：Streamlit 主应用。
+- `api/`：供本地网页或 GPT 辅助页面调用的草稿 API 客户端。
+- `components/`：可复用的前端交互组件，例如 PDF 图片拖拽裁剪器。
 - `services/`：SQLite 数据库服务、导入服务、导出服务、专题服务、回溯服务、本地偏好服务、录入解析服务等。
 - `scripts/`：本地初始化、schema migration、旧库迁移、数据包迁移、审计、smoke、发布检查脚本。
 - `db/schema.sql`：空库基线 schema。
@@ -14,7 +16,7 @@
 - `docs/planning/`：重构规划、迁移流程、安装更新流程、发布清单。
 - `templates/`：可复用模板。
 - `utils/`：可复用工具函数，但不包含本地索引数据库。
-- `README.md`、`env.example`、`.gitignore`、`requirements.txt`、`启动程序.bat`。
+- `README.md`、`env.example`、`.gitignore`、`requirements.txt`、`requirements-optional.txt`、`启动程序.bat`、`启动本地录题API.bat`。
 
 ## 2. 不应进入 Git 的内容
 
@@ -44,8 +46,8 @@ python scripts/build_source_release_package.py --create
 
 白名单发布包只允许进入：
 
-- 根目录必要源码与配置：`question_bank_app.py`、`requirements.txt`、`env.example`、`README.md`、`.gitignore`、启动脚本等；
-- `services/`、`scripts/`、`db/`、`docs/`、`templates/`、`utils/`、`fig/`、`cover/`；
+- 根目录必要源码与配置：`question_bank_app.py`、`requirements.txt`、`requirements-optional.txt`、`env.example`、`README.md`、`.gitignore`、启动脚本等；
+- `api/`、`components/`、`services/`、`scripts/`、`db/`、`docs/`、`templates/`、`utils/`、`fig/`、`cover/`；
 - `Test Paper Group/主题模板/` 中的模板源码；
 - `data/`、`db/seed/`、`assets/questions/`、`exports/`、`reports/`、`chapters/` 的 `.gitkeep` 占位文件。
 
@@ -109,7 +111,7 @@ python scripts/audit_tracked_private_files.py
 - `release_readiness.py --skip-slow`：`status=warning`，`failed=0`。
 - warning 来源：当前工作区存在真实未提交改动，需要人工确认文件清单。
 - 未发现未被忽略的正式 SQLite 数据库、报告文件或题目图片目录。
-- 当前仍存在历史上已经被 Git 跟踪的 `chapters/**`、`Test Paper Group/导出文件/**` 与 `db/seed/**`；这类文件需要用 `git rm --cached` 从 Git 当前版本移除，但本地文件不删除。
+- 当前审计未发现真实题源、导出文件或个人题库数据仍被 Git 跟踪；如果未来再次出现，才需要用 `git rm --cached` 从 Git 当前版本移除，但本地文件不删除。
 - 检查生成的 `reports/*.json`、`reports/*.md` 属于本地临时报表，验证后应清理，不随 commit 提交。
 
 ## 6. 推送前建议流程

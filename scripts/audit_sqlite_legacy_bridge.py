@@ -24,6 +24,17 @@ from services.question_db_service import QuestionListFilters, count_questions, l
 from services.sqlite_legacy_adapter import list_sqlite_legacy_cards, resolve_legacy_card_file_path
 
 
+def is_sqlite_native_path(path: str) -> bool:
+    """Return whether the path is the virtual path used by SQLite-only drafts.
+
+    Newly committed drafts intentionally remain in SQLite and do not create a
+    legacy ``.tex`` file.  They must be reported separately from a migrated
+    question whose real legacy file has gone missing.
+    """
+    normalized = str(path or "").strip().replace("\\", "/")
+    return normalized == "sqlite_committed" or normalized.startswith("sqlite_committed/")
+
+
 def relative_to_root(path: str | Path) -> str:
     resolved = Path(path).resolve()
     try:
@@ -63,11 +74,20 @@ def audit_bridge(db_path: str, *, limit: int, page_size: int, content_sample: in
     total_questions = count_questions(db_path)
     summaries = iter_summaries(db_path, limit=limit, page_size=page_size)
     unresolved: list[dict[str, str]] = []
+    sqlite_native: list[dict[str, str]] = []
     resolved_paths: list[str] = []
     seen_paths: set[str] = set()
 
     for row in summaries:
         raw_path = str(row.get("legacy_file_path") or "")
+        if is_sqlite_native_path(raw_path):
+            sqlite_native.append(
+                {
+                    "question_id": str(row.get("question_id") or ""),
+                    "legacy_file_path": raw_path,
+                }
+            )
+            continue
         resolved = resolve_legacy_card_file_path({"path": raw_path}, PROJECT_ROOT)
         if resolved:
             if resolved not in seen_paths:
@@ -123,6 +143,8 @@ def audit_bridge(db_path: str, *, limit: int, page_size: int, content_sample: in
         "resolved_paths": len(resolved_paths),
         "unresolved_count": len(unresolved),
         "unresolved_sample": unresolved[:30],
+        "sqlite_native_count": len(sqlite_native),
+        "sqlite_native_sample": sqlite_native[:30],
         "content_sample": len(content_checks),
         "content_failures": failed_content[:30],
         "blockers": blockers,
@@ -164,6 +186,12 @@ def write_reports(report: dict[str, Any], stamp: str) -> tuple[Path, Path]:
             "- 逐字差异通常来自元数据、空白和规范化导出格式，不应作为迁移阻塞依据。",
         ]
     )
+    if report["sqlite_native_sample"]:
+        lines.extend(["", "## SQLite 原生题（不要求旧 TeX 文件）", ""])
+        lines.extend(
+            f"- `{item['question_id']}`：`{item['legacy_file_path']}`"
+            for item in report["sqlite_native_sample"]
+        )
     if report["unresolved_sample"]:
         lines.extend(["", "## 未解析样例", ""])
         lines.extend(
@@ -190,6 +218,7 @@ def main() -> int:
     print(f"status={report['status']}")
     print(f"scanned={report['scanned_questions']}")
     print(f"resolved_paths={report['resolved_paths']}")
+    print(f"sqlite_native={report['sqlite_native_count']}")
     print(f"unresolved={report['unresolved_count']}")
     if not args.no_report:
         print(f"report={report['report']}")

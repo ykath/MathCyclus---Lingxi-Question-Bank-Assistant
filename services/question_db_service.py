@@ -360,6 +360,8 @@ def list_questions_page(
         keyword=filters.keyword,
         year=filters.year,
         chapter=filters.chapter,
+        source_kind=filters.source_kind,
+        paper_series=filters.paper_series,
         source=filters.source,
         question_number=filters.question_number,
         question_type_id=filters.question_type_id,

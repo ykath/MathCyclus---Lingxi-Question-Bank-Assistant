@@ -64,6 +64,12 @@ BLOCKING_FIELDS = {
     "相对文件路径",
 }
 
+
+def is_sqlite_native_path(path: str) -> bool:
+    """Return whether a row intentionally has no legacy TeX file yet."""
+    normalized = str(path or "").strip().replace("\\", "/")
+    return normalized == "sqlite_committed" or normalized.startswith("sqlite_committed/")
+
 TAG_SPLIT_RE = re.compile(r"[，,、;；\s]+")
 SPACE_RE = re.compile(r"\s+")
 
@@ -264,6 +270,26 @@ def compare_row_sets(
 def audit(db_path: str, root: Path, *, sample_size: int) -> dict[str, Any]:
     sqlite_total = count_questions(db_path)
     sqlite_rows = list_sqlite_legacy_rows(db_path, QuestionListFilters(limit=100, offset=0), max_rows=0)
+    def row_question_id(row: dict[str, str]) -> str:
+        for key, value in row.items():
+            if str(key).startswith("SQLite"):
+                return str(value or "")
+        return ""
+
+    def row_legacy_path(row: dict[str, str]) -> str:
+        for key, value in row.items():
+            if str(key).endswith("路径"):
+                return str(value or "")
+        return ""
+
+    sqlite_native_rows = [
+        row for row in sqlite_rows if is_sqlite_native_path(row_legacy_path(row))
+    ]
+    # SQLite-only drafts are a supported current storage mode.  Exclude them
+    # from the transitional TeX comparison while retaining them in the report.
+    sqlite_legacy_rows = [
+        row for row in sqlite_rows if not is_sqlite_native_path(row_legacy_path(row))
+    ]
     legacy_tex_rows, skipped_non_questions = load_legacy_tex_rows(root)
     csv_present, csv_rows = load_csv_rows_if_present()
 
@@ -271,7 +297,7 @@ def audit(db_path: str, root: Path, *, sample_size: int) -> dict[str, Any]:
         "legacy_tex",
         legacy_tex_rows,
         "sqlite",
-        sqlite_rows,
+        sqlite_legacy_rows,
         sample_size=sample_size,
     )
 
@@ -321,6 +347,15 @@ def audit(db_path: str, root: Path, *, sample_size: int) -> dict[str, Any]:
         "warnings": warnings,
         "sqlite_total": sqlite_total,
         "sqlite_rows": len(sqlite_rows),
+        "sqlite_legacy_rows": len(sqlite_legacy_rows),
+        "sqlite_native_rows": len(sqlite_native_rows),
+        "sqlite_native_sample": [
+            {
+                "question_id": row_question_id(row),
+                "legacy_file_path": row_legacy_path(row),
+            }
+            for row in sqlite_native_rows[:sample_size]
+        ],
         "legacy_tex_rows": len(legacy_tex_rows),
         "legacy_non_question_skipped": skipped_non_questions,
         "csv_present": csv_present,
@@ -475,6 +510,7 @@ def main() -> int:
 
     print(f"status={report['status']}")
     print(f"sqlite_rows={report['sqlite_rows']}")
+    print(f"sqlite_native={report['sqlite_native_rows']}")
     print(f"legacy_tex_rows={report['legacy_tex_rows']}")
     print(f"tex_only={report['tex_vs_sqlite']['left_only_count']}")
     print(f"sqlite_only={report['tex_vs_sqlite']['right_only_count']}")

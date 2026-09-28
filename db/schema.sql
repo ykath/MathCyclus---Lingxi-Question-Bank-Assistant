@@ -81,9 +81,26 @@ CREATE TABLE IF NOT EXISTS question_equivalence (
     confidence REAL,
     review_status TEXT NOT NULL DEFAULT 'pending',
     note TEXT NOT NULL DEFAULT '',
+    relation_source TEXT NOT NULL DEFAULT 'manual',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT '',
     UNIQUE(question_id_a, question_id_b, relation_type),
     CHECK(question_id_a != question_id_b)
+);
+
+CREATE TABLE IF NOT EXISTS question_equivalence_event (
+    event_id TEXT PRIMARY KEY,
+    equivalence_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    before_status TEXT NOT NULL DEFAULT '',
+    after_status TEXT NOT NULL DEFAULT '',
+    before_relation_type TEXT NOT NULL DEFAULT '',
+    after_relation_type TEXT NOT NULL DEFAULT '',
+    relation_source TEXT NOT NULL DEFAULT '',
+    operator TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS paper (
@@ -298,6 +315,10 @@ CREATE TABLE IF NOT EXISTS question_import_draft (
     confidence_json TEXT NOT NULL DEFAULT '{}',
     validation_json TEXT NOT NULL DEFAULT '{}',
     extra_json TEXT NOT NULL DEFAULT '{}',
+    content_hash TEXT NOT NULL DEFAULT '',
+    approved_content_hash TEXT NOT NULL DEFAULT '',
+    approved_by TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -330,6 +351,21 @@ CREATE TABLE IF NOT EXISTS import_report_item (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS draft_review_event (
+    event_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL REFERENCES question_import_draft(draft_id) ON DELETE CASCADE,
+    batch_id TEXT NOT NULL REFERENCES import_batch(batch_id) ON DELETE CASCADE,
+    stage TEXT NOT NULL DEFAULT 'human_review',
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    operator TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS legacy_question_map (
     question_id TEXT PRIMARY KEY REFERENCES question(question_id) ON DELETE CASCADE,
     legacy_id TEXT,
@@ -354,6 +390,10 @@ CREATE INDEX IF NOT EXISTS idx_question_knowledge_area_area ON question_knowledg
 CREATE INDEX IF NOT EXISTS idx_question_knowledge_area_question ON question_knowledge_area(question_id, knowledge_area_id);
 CREATE INDEX IF NOT EXISTS idx_question_equivalence_a ON question_equivalence(question_id_a);
 CREATE INDEX IF NOT EXISTS idx_question_equivalence_b ON question_equivalence(question_id_b);
+CREATE INDEX IF NOT EXISTS idx_question_equivalence_event_relation
+    ON question_equivalence_event(equivalence_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_question_equivalence_source
+    ON question_equivalence(relation_source, review_status);
 CREATE INDEX IF NOT EXISTS idx_paper_year ON paper(year);
 CREATE INDEX IF NOT EXISTS idx_paper_question_question ON paper_question(question_id);
 CREATE INDEX IF NOT EXISTS idx_paper_question_paper_order ON paper_question(paper_id, display_order, question_number, sub_number);
@@ -365,6 +405,8 @@ CREATE INDEX IF NOT EXISTS idx_topic_question_question ON topic_question(questio
 CREATE INDEX IF NOT EXISTS idx_question_asset_question ON question_asset(question_id);
 CREATE INDEX IF NOT EXISTS idx_question_revision_question ON question_revision(question_id);
 CREATE INDEX IF NOT EXISTS idx_import_report_batch ON import_report_item(batch_id);
+CREATE INDEX IF NOT EXISTS idx_draft_review_event_draft ON draft_review_event(draft_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_draft_review_event_batch ON draft_review_event(batch_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_question_import_draft_batch ON question_import_draft(batch_id);
 CREATE INDEX IF NOT EXISTS idx_question_import_draft_status ON question_import_draft(review_status);
 CREATE INDEX IF NOT EXISTS idx_draft_batch_status_updated ON question_import_draft(batch_id, review_status, updated_at);
@@ -381,7 +423,7 @@ INSERT OR IGNORE INTO question_type(question_type_id, code, name, description) V
 
 INSERT OR IGNORE INTO app_meta(key, value) VALUES
     ('app_name', 'MathCyclus'),
-    ('schema_version', '5'),
+    ('schema_version', '9'),
     ('schema_baseline', '20260903');
 
 INSERT OR IGNORE INTO schema_migration(version, name, checksum) VALUES
@@ -389,4 +431,8 @@ INSERT OR IGNORE INTO schema_migration(version, name, checksum) VALUES
     (2, 'topic_intro_fields', ''),
     (3, 'paper_catalog_matching', ''),
     (4, 'draft_asset_crop_metadata', '767bc1ff13350fb250eca2099c087aaa1efacc4c38a35e35fa7ef24071a1fd09'),
-    (5, 'runtime_query_indexes', '');
+    (5, 'runtime_query_indexes', ''),
+    (6, 'question_fts', '8335477992019a5df1f72a164473383d6e84dea7d6de03626457b41ac82d02ed'),
+    (7, 'judgement_question_type', '2953b195ca0484c4daaf642959726108ff5ed37220b3971e1ef83b9c51000e77'),
+    (8, 'draft_review_gate', '6938dbe0f3acf8de3ac7ab514022e10024cdfb2c6805144eb74492d4eb50e018'),
+    (9, 'equivalence_relation_audit', '2b91ea10a1b41c8c357f439ed58040826a87d8fc7f8e91a1995e093dc4815241');

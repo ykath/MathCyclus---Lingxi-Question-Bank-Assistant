@@ -94,6 +94,13 @@ def main() -> int:
                 check("source_pdf_copied", (job_dir / "source.pdf").is_file()),
                 check("page_images_rendered", all((job_dir / f"pages/page_{number:03d}.png").is_file() for number in (1, 2))),
                 check("manifest_page_count", manifest.get("document", {}).get("page_count") == 2, manifest),
+                check(
+                    "provenance_snapshot",
+                    manifest.get("provenance", {}).get("input_sha256") == manifest.get("source", {}).get("sha256")
+                    and manifest.get("provenance", {}).get("ai", {}).get("recognizer_version") == "page_v1"
+                    and bool(manifest.get("provenance", {}).get("ai", {}).get("prompt", {}).get("sha256")),
+                    manifest.get("provenance"),
+                ),
                 check("draft_text_extracted", "x^2 + 1" in draft["pages"][0]["raw_text"] and "y = 2x" in draft["pages"][1]["raw_text"]),
                 check("question_candidates_created", len(draft.get("questions") or []) == 2, draft.get("questions")),
                 check(
@@ -159,18 +166,13 @@ def main() -> int:
         checks.append(check("job_listed", len(listed_jobs) == 1 and listed_jobs[0]["job_id"] == "pdf_smoke_job", listed_jobs))
         checks.append(check("job_loaded", loaded_job["draft_payload"]["job_id"] == "pdf_smoke_job"))
         first_candidate_id = draft["questions"][0]["source_item_id"]
-        try:
-            update_pdf_question_candidate(
-                "pdf_smoke_job",
-                first_candidate_id,
-                {"review_status": "ready"},
-                jobs_root=temp_root / "jobs",
-            )
-        except ValueError:
-            incomplete_ready_blocked = True
-        else:
-            incomplete_ready_blocked = False
-        checks.append(check("incomplete_ready_blocked", incomplete_ready_blocked))
+        incomplete_ready = update_pdf_question_candidate(
+            "pdf_smoke_job",
+            first_candidate_id,
+            {"review_status": "ready"},
+            jobs_root=temp_root / "jobs",
+        )
+        checks.append(check("missing_answer_solution_do_not_block_ready", incomplete_ready["review_status"] == "ready", incomplete_ready))
         update_result = update_pdf_question_candidate(
             "pdf_smoke_job",
             first_candidate_id,
@@ -196,8 +198,8 @@ def main() -> int:
         bulk_result = bulk_mark_pdf_candidates_ready("pdf_smoke_job", jobs_root=temp_root / "jobs")
         checks.append(
             check(
-                "bulk_ready_keeps_incomplete_for_review",
-                bulk_result["ready_count"] == 1 and bulk_result["skipped_count"] == 1,
+                "bulk_ready_allows_missing_answer_solution",
+                bulk_result["ready_count"] == 2 and bulk_result["skipped_count"] == 0,
                 bulk_result,
             )
         )

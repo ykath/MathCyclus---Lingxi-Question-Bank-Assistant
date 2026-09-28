@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import os
@@ -78,6 +79,14 @@ def _load_shared_ocr_typesetting_rules() -> str:
         prompt,
     )
     return match.group(1).strip() if match else fallback
+
+
+def _ocr_prompt_sha256() -> str:
+    """Return the prompt fingerprint used by the current OCR recognizer."""
+    try:
+        return hashlib.sha256(_OCR_PROMPT_PATH.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def _normalize_tex_text(value: object) -> str:
@@ -395,6 +404,13 @@ def recognize_document_page_tex(
         content_text = message.get("content") or ""
         if isinstance(content_text, list):
             content_text = "".join(str(item.get("text") or "") for item in content_text if isinstance(item, dict))
-        return {"tex": str(content_text).replace("```latex", "").replace("```tex", "").replace("```", "").strip(), "page_number": page_number, "model_name": model_name}
+        return {
+            "tex": str(content_text).replace("```latex", "").replace("```tex", "").replace("```", "").strip(),
+            "page_number": page_number,
+            "model_name": model_name,
+            "prompt_file": "ocr_prompt.txt",
+            "prompt_sha256": _ocr_prompt_sha256(),
+            "recognizer_version": "page_v1",
+        }
     except Exception as exc:
         return {"error": f"AI 页面识别失败：{exc}"}

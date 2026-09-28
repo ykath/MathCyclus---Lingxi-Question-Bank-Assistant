@@ -35,7 +35,10 @@ def main() -> int:
         )
         result = load_mineru_content_list(root)
         parsers = available_document_parsers()
+        parser_names = {item["name"] for item in parsers}
         checks = {
+            "parser_set_is_explicit": parser_names == {"mineru_cloud", "pymupdf"},
+            "no_local_mineru_parser": "mineru_local" not in parser_names,
             "pymupdf_available": any(item["name"] == "pymupdf" and item["available"] for item in parsers),
             "block_types_normalized": [item["type"] for item in result["blocks"]] == ["text", "formula", "image"],
             "page_index_normalized": all(item["page_number"] == 1 for item in result["blocks"]),

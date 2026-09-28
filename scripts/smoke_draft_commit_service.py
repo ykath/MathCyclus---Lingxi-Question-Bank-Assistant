@@ -20,11 +20,13 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from services.import_service import (
+    approve_draft_for_commit,
     commit_draft_to_question,
     create_manual_entry_draft,
     get_draft_question,
     update_draft_question_fields,
 )
+from services.schema_migration_service import apply_pending_migrations
 from services.question_db_service import count_questions, get_question
 from services.revision_service import list_question_revisions
 
@@ -73,6 +75,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="mathcyclus_draft_commit_smoke_") as tmp_dir:
         temp_db = Path(tmp_dir) / source_db.name
         shutil.copy2(source_db, temp_db)
+        apply_pending_migrations(str(temp_db), apply=True, backup=False, allow_external_database=True)
 
         question_count_before = count_questions(str(temp_db))
         insert_draft_result = create_manual_entry_draft(
@@ -111,6 +114,7 @@ def main() -> None:
             },
             operator="smoke_draft_commit",
         )
+        approve_draft_for_commit(str(temp_db), insert_draft_id, operator="smoke_reviewer")
         insert_result = commit_draft_to_question(str(temp_db), insert_draft_id, operator="smoke_draft_commit")
         inserted_question_id = str(insert_result.get("question_id") or "")
         inserted_question = get_question(str(temp_db), inserted_question_id)
@@ -153,7 +157,7 @@ def main() -> None:
             duplicate_blocked = False
             duplicate_error = ""
         except ValueError as exc:
-            duplicate_blocked = "ready/approved" in str(exc)
+            duplicate_blocked = "approved" in str(exc)
             duplicate_error = str(exc)
         checks.append(check("committed_draft_cannot_commit_again", duplicate_blocked, duplicate_error))
 
@@ -185,6 +189,7 @@ def main() -> None:
             stamp="smoke_draft_commit_update",
         )
         update_draft_id = str(update_draft_result.get("draft_id") or "")
+        approve_draft_for_commit(str(temp_db), update_draft_id, operator="smoke_reviewer")
         update_result = commit_draft_to_question(str(temp_db), update_draft_id, operator="smoke_draft_commit")
         updated_question = get_question(str(temp_db), inserted_question_id)
         checks.extend(
@@ -227,6 +232,7 @@ def main() -> None:
             stamp="smoke_draft_commit_skip",
         )
         skip_draft_id = str(skip_draft_result.get("draft_id") or "")
+        approve_draft_for_commit(str(temp_db), skip_draft_id, operator="smoke_reviewer")
         skip_result = commit_draft_to_question(str(temp_db), skip_draft_id, operator="smoke_draft_commit")
         checks.extend(
             [

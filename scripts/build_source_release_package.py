@@ -19,15 +19,19 @@ INCLUDE_FILES = [
     ".gitignore",
     "README.md",
     "requirements.txt",
+    "requirements-optional.txt",
     "env.example",
     "question_bank_app.py",
     "启动程序.bat",
     "启动程序.py",
+    "启动本地录题API.bat",
     "MathCyclus_book.cls",
     "main.tex",
 ]
 
 INCLUDE_DIRS = [
+    "api",
+    "components",
     "services",
     "scripts",
     "db",
@@ -43,6 +47,8 @@ PLACEHOLDER_FILES = [
     "data/.gitkeep",
     "data/backups/.gitkeep",
     "data/indexes/.gitkeep",
+    "data/imports/.gitkeep",
+    "data/imports/pdf_jobs/.gitkeep",
     "db/seed/.gitkeep",
     "assets/questions/.gitkeep",
     "reports/.gitkeep",

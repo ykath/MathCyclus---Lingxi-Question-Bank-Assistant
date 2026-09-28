@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import shutil
 from pathlib import Path
@@ -12,18 +11,8 @@ from services.mineru_cloud_service import mineru_cloud_available, mineru_cloud_c
 from services.mineru_cloud_service import parse_pdf_to_directory
 
 
-def mineru_availability() -> dict[str, Any]:
-    executable = shutil.which("mineru") or shutil.which("magic-pdf") or ""
-    module_name = "mineru" if importlib.util.find_spec("mineru") else "magic_pdf" if importlib.util.find_spec("magic_pdf") else ""
-    return {
-        "available": bool(executable or module_name),
-        "executable": executable,
-        "module": module_name,
-    }
-
-
 def available_document_parsers() -> list[dict[str, Any]]:
-    mineru = mineru_availability()
+    """Return only parsers used by the question-bank pipeline."""
     cloud = mineru_cloud_config()
     return [
         {
@@ -31,12 +20,6 @@ def available_document_parsers() -> list[dict[str, Any]]:
             "available": bool(cloud["configured"]),
             "detail": {"base_url": cloud["base_url"], "configured": cloud["configured"]},
             "capabilities": ["layout", "text", "formula", "image", "table", "ocr"],
-        },
-        {
-            "name": "mineru",
-            "available": mineru["available"],
-            "detail": mineru,
-            "capabilities": ["layout", "text", "formula", "image", "table"],
         },
         {
             "name": "pymupdf",
@@ -50,7 +33,7 @@ def available_document_parsers() -> list[dict[str, Any]]:
 def preferred_document_parser() -> str:
     if mineru_cloud_available():
         return "mineru_cloud"
-    return "mineru" if mineru_availability()["available"] else "pymupdf"
+    return "pymupdf"
 
 
 def normalize_parser_mode(value: str | None) -> str:
@@ -68,25 +51,32 @@ def parse_with_boundary(
     *,
     mode: str = "auto",
 ) -> dict[str, Any]:
-    """Run cloud parsing with an explicit local fallback boundary."""
+    """Run cloud MinerU with an explicit PyMuPDF fallback boundary."""
     selected = normalize_parser_mode(mode)
+    failures: list[str] = []
+
+    if selected in {"auto", "cloud"}:
+        if not mineru_cloud_available():
+            if selected == "cloud":
+                raise RuntimeError("已选择云端 MinerU，但未配置 MINERU_API_TOKEN")
+            failures.append("cloud_not_configured")
+        else:
+            try:
+                result = parse_pdf_to_directory(pdf_path, output_dir)
+                return {**result, "parser": "mineru_cloud", "fallback": False, "reason": "cloud_success"}
+            except Exception as exc:
+                if selected == "cloud":
+                    raise
+                failures.append(f"cloud_failed:{type(exc).__name__}: {exc}")
+
     if selected == "local":
-        return {"parser": "pymupdf", "fallback": False, "reason": "mode=local"}
-    if not mineru_cloud_available():
-        if selected == "cloud":
-            raise RuntimeError("已选择云端 MinerU，但未配置 MINERU_API_TOKEN")
-        return {"parser": "pymupdf", "fallback": True, "reason": "MinerU cloud is not configured"}
-    try:
-        result = parse_pdf_to_directory(pdf_path, output_dir)
-        return {**result, "parser": "mineru_cloud", "fallback": False, "reason": "cloud_success"}
-    except Exception as exc:
-        if selected == "cloud":
-            raise
-        return {
-            "parser": "pymupdf",
-            "fallback": True,
-            "reason": f"MinerU cloud failed: {type(exc).__name__}: {exc}",
-        }
+        failures.append("pymupdf_local_mode")
+
+    return {
+        "parser": "pymupdf",
+        "fallback": bool(failures),
+        "reason": "; ".join(failures) or "mode=local",
+    }
 
 
 def find_mineru_content_list(output_root: str | Path) -> Path:

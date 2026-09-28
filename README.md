@@ -76,6 +76,8 @@
    .venv\Scripts\activate
    pip install -r requirements.txt
    ```
+   基础 PDF 录入不要求安装 OpenCV；如果需要扫描页的复杂图像区域检测或增强裁剪，再执行
+   `pip install -r requirements-optional.txt`。
 3. 初始化本地运行目录和空 SQLite 数据库：
 
    ```bash
@@ -177,6 +179,7 @@ python scripts/audit_tracked_private_files.py --apply --confirm KEEP_LOCAL
 ```text
 ├── chapters/              # 存放按学科板块和年份分类的 LaTeX 题库源文件 (.tex)
 ├── db/                    # SQLite schema、迁移脚本和 seed 占位目录
+├── docs/ai/               # AI/队友任务路由、录入规范和当前硬规则
 ├── services/              # 数据库、编辑、导出、统计、图片和迁移等服务层
 ├── scripts/               # 本地初始化、迁移、审计、smoke 和发布检查脚本
 ├── data/                  # 本地 SQLite 数据库、本地偏好和备份（默认不提交）
