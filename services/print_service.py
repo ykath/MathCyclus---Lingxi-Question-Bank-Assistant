@@ -170,7 +170,8 @@ def compile_tex(tex_content: str, out_dir: str, name: str,
         for _ in range(2):  # 两遍编译以解析 lastpage 引用
             proc = subprocess.run(
                 ["xelatex", "-interaction=nonstopmode", "-output-directory", out_dir, tex_path],
-                capture_output=True, text=True, timeout=timeout, cwd=out_dir,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, cwd=out_dir,
             )
         pdf_path = os.path.join(out_dir, f"{name}.pdf")
         if proc.returncode != 0 or not os.path.exists(pdf_path):
