@@ -459,7 +459,7 @@ def list_drafts(review_status: list[str] | None = None,
 def update_draft(draft_id: int, updates: dict, db_path: str | None = None) -> None:
     allowed = {"stem_tex", "answer_tex", "solution_tex", "difficulty", "note",
                "question_type", "review_status", "source_label", "proposed_action"}
-    json_fields = {"choices": "choices_json", "tags": "tags_json"}
+    json_fields = {"choices": "choices_json", "tags": "tags_json", "extra": "extra_json"}
     sets, params = [], []
     for key, value in updates.items():
         if key in allowed:
@@ -606,6 +606,394 @@ def set_setting(key: str, value, db_path: str | None = None) -> None:
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
                 (key, _dump_json(value), _now()),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ------------------------------------------------------------
+# 题目资源（M2-T02：错题原始照片等）
+# ------------------------------------------------------------
+
+def add_question_asset(question_id: str, file_path: str, role: str = "source",
+                       original_file_name: str = "", caption: str = "",
+                       db_path: str | None = None) -> int:
+    ensure_initialized(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            cur = conn.execute(
+                """INSERT INTO question_asset
+                   (question_id, role, file_path, original_file_name, caption, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (question_id, role, file_path, original_file_name, caption, _now()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+
+def list_question_assets(question_id: str, role: str | None = None,
+                         db_path: str | None = None) -> list[dict]:
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        if role:
+            rows = conn.execute(
+                "SELECT * FROM question_asset WHERE question_id=? AND role=? ORDER BY sort_order",
+                (question_id, role)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM question_asset WHERE question_id=? ORDER BY sort_order",
+                (question_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------
+# 错题本（M2-T01/T03）：错题生命周期与状态机
+# ------------------------------------------------------------
+
+WRONG_REASONS = ["计算失误", "概念不清", "审题错误", "方法不会", "其他"]
+MISTAKE_STATUS = {"pending": "待重练", "mastered": "已掌握"}
+
+
+def add_mistake(question_id: str, wrong_reason: str = "其他", wrong_date: str | None = None,
+                source_text: str = "", original_photo_asset_id: int | None = None,
+                pass_threshold: int = 2, db_path: str | None = None) -> tuple[int | None, str]:
+    """把题目加入错题本。同一题只能有一条错题记录。"""
+    ensure_initialized(db_path)
+    if wrong_reason not in WRONG_REASONS:
+        wrong_reason = "其他"
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            existing = conn.execute(
+                "SELECT mistake_id, status FROM mistake_record WHERE question_id=?",
+                (question_id,)).fetchone()
+            if existing:
+                return None, "这道题已经在错题本里了"
+            cur = conn.execute(
+                """INSERT INTO mistake_record
+                   (question_id, wrong_reason, wrong_date, source_text,
+                    original_photo_asset_id, status, pass_count, pass_threshold,
+                    created_at, updated_at)
+                   VALUES (?,?,?,?,?,'pending',0,?,?,?)""",
+                (question_id, wrong_reason, wrong_date or _today(), source_text,
+                 original_photo_asset_id, max(1, int(pass_threshold)), _now(), _now()),
+            )
+            conn.commit()
+            return int(cur.lastrowid), ""
+        finally:
+            conn.close()
+
+
+def get_mistake(question_id: str, db_path: str | None = None) -> dict | None:
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM mistake_record WHERE question_id=?", (question_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def update_mistake(question_id: str, updates: dict, db_path: str | None = None) -> bool:
+    allowed = {"wrong_reason", "wrong_date", "source_text", "pass_threshold"}
+    sets, params = [], []
+    for key, value in updates.items():
+        if key in allowed:
+            sets.append(f"{key}=?")
+            params.append(value)
+    if not sets:
+        return False
+    sets.append("updated_at=?")
+    params.extend([_now(), question_id])
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            cur = conn.execute(
+                f"UPDATE mistake_record SET {', '.join(sets)} WHERE question_id=?", params)
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_mistakes(status: str | None = "pending", wrong_reason: str | None = None,
+                  tags: list[str] | None = None, since_date: str | None = None,
+                  idle_days: int | None = None,
+                  db_path: str | None = None) -> list[dict]:
+    """错题列表（联表题目）。idle_days：距上次练习超过 N 天（从未练过也算）。"""
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        where, params = ["1=1"], []
+        if status:
+            where.append("m.status=?")
+            params.append(status)
+        if wrong_reason:
+            where.append("m.wrong_reason=?")
+            params.append(wrong_reason)
+        if since_date:
+            where.append("m.wrong_date>=?")
+            params.append(since_date)
+        if idle_days:
+            where.append(
+                "(m.last_practiced_at IS NULL OR date(m.last_practiced_at) <= date('now','localtime', ?))")
+            params.append(f"-{int(idle_days)} days")
+        rows = conn.execute(
+            f"""SELECT m.*, q.stem_tex, q.choices_json, q.answer_tex, q.solution_tex,
+                       q.difficulty, q.tags_json, q.note
+                FROM mistake_record m JOIN question q ON q.question_id = m.question_id
+                WHERE {' AND '.join(where)}
+                ORDER BY m.updated_at DESC""", params).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item["tags_json"]) if item.get("tags_json") else []
+            item["choices"] = json.loads(item["choices_json"]) if item.get("choices_json") else []
+            if tags and not all(t in item["tags"] for t in tags):
+                continue
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def record_practice(question_id: str, result: str, print_job_id: int | None = None,
+                    note: str = "", db_path: str | None = None) -> tuple[bool, str]:
+    """批改登记（M2-T03 状态机）：
+    - correct：pass_count + 1，达到 pass_threshold 自动转「已掌握」
+    - wrong：保持「待重练」，更新最近练习时间
+    返回 (是否成功, 状态说明)。"""
+    if result not in ("correct", "wrong"):
+        return False, "结果只能是 correct 或 wrong"
+    ensure_initialized(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            mistake = conn.execute(
+                "SELECT * FROM mistake_record WHERE question_id=? AND status='pending'",
+                (question_id,)).fetchone()
+            mistake_id = mistake["mistake_id"] if mistake else None
+            conn.execute(
+                """INSERT INTO practice_record
+                   (question_id, mistake_id, print_job_id, practiced_at, result, note)
+                   VALUES (?,?,?,?,?,?)""",
+                (question_id, mistake_id, print_job_id, _now(), result, note),
+            )
+            if not mistake:
+                conn.commit()
+                return True, "已记录练习（该题不在待重练错题中）"
+
+            if result == "correct":
+                new_count = mistake["pass_count"] + 1
+                if new_count >= mistake["pass_threshold"]:
+                    conn.execute(
+                        """UPDATE mistake_record SET pass_count=?, status='mastered',
+                           last_practiced_at=?, updated_at=? WHERE mistake_id=?""",
+                        (new_count, _now(), _now(), mistake_id))
+                    msg = f"做对啦！已累计通过 {new_count} 次，移入「已掌握」🎉"
+                else:
+                    conn.execute(
+                        """UPDATE mistake_record SET pass_count=?, last_practiced_at=?,
+                           updated_at=? WHERE mistake_id=?""",
+                        (new_count, _now(), _now(), mistake_id))
+                    msg = f"已记录做对（{new_count}/{mistake['pass_threshold']} 次后移出错题本）"
+            else:
+                conn.execute(
+                    "UPDATE mistake_record SET last_practiced_at=?, updated_at=? WHERE mistake_id=?",
+                    (_now(), _now(), mistake_id))
+                msg = "已记录做错，继续保持「待重练」"
+            conn.commit()
+            return True, msg
+        finally:
+            conn.close()
+
+
+def restore_mistake(question_id: str, db_path: str | None = None) -> bool:
+    """把「已掌握」错题恢复为「待重练」（清零通过次数）。"""
+    ensure_initialized(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            cur = conn.execute(
+                """UPDATE mistake_record SET status='pending', pass_count=0, updated_at=?
+                   WHERE question_id=? AND status='mastered'""",
+                (_now(), question_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def remove_mistake(question_id: str, db_path: str | None = None) -> bool:
+    """移出错题本（题目本身保留在题库）。"""
+    ensure_initialized(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            cur = conn.execute("DELETE FROM mistake_record WHERE question_id=?", (question_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_practice_records(question_id: str, db_path: str | None = None) -> list[dict]:
+    """题目练习时间线（新→旧）。"""
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM practice_record WHERE question_id=? ORDER BY practiced_at DESC",
+            (question_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mistake_reason_counts(db_path: str | None = None) -> dict[str, int]:
+    """待重练错题的错因分布（M2-T04 计数条）。"""
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT wrong_reason, COUNT(*) c FROM mistake_record "
+            "WHERE status='pending' GROUP BY wrong_reason").fetchall()
+        return {r["wrong_reason"] or "其他": r["c"] for r in rows}
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------
+# 找同类题（M2-T06）：按知识点重叠 + 难度接近推荐
+# ------------------------------------------------------------
+
+def find_similar_by_tags(question_id: str, limit: int = 5,
+                         db_path: str | None = None) -> list[dict]:
+    """按知识点标签重叠度推荐同类题，优先经典题；排除自身与已在错题本的题。"""
+    ensure_initialized(db_path)
+    source = get_question(question_id, db_path)
+    if not source or not source.get("tags"):
+        return []
+    source_tags = set(source["tags"])
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT question_id, stem_tex, difficulty, tags_json, is_classic, note
+               FROM question
+               WHERE question_id != ?
+                 AND question_id NOT IN (SELECT question_id FROM mistake_record)""",
+            (question_id,)).fetchall()
+        scored = []
+        for row in rows:
+            item = dict(row)
+            item_tags = set(json.loads(item["tags_json"]) if item.get("tags_json") else [])
+            overlap = len(source_tags & item_tags)
+            if overlap == 0:
+                continue
+            diff_gap = abs((item.get("difficulty") or 3) - (source.get("difficulty") or 3))
+            scored.append((overlap, int(item.get("is_classic") or 0), -diff_gap, item))
+        scored.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+        result = []
+        for _ov, _classic, _gap, item in scored[:limit]:
+            item["tags"] = json.loads(item["tags_json"]) if item.get("tags_json") else []
+            result.append(item)
+        return result
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------
+# 打印篮底座（M2 先提供加入/查看能力，完整打印流程在 M3）
+# ------------------------------------------------------------
+
+def get_or_create_basket(db_path: str | None = None) -> int:
+    """获取当前打印篮（status='draft' 的 print_job），没有则创建。"""
+    ensure_initialized(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT print_job_id FROM print_job WHERE status='draft' "
+                "ORDER BY updated_at DESC LIMIT 1").fetchone()
+            if row:
+                return row["print_job_id"]
+            cur = conn.execute(
+                "INSERT INTO print_job (title, status) VALUES ('打印篮', 'draft')")
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            conn.close()
+
+
+def basket_add(question_id: str, db_path: str | None = None) -> tuple[bool, str]:
+    basket_id = get_or_create_basket(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM print_job_item WHERE print_job_id=? AND question_id=?",
+                (basket_id, question_id)).fetchone()
+            if exists:
+                return False, "这道题已在打印篮里"
+            order = conn.execute(
+                "SELECT COALESCE(MAX(display_order),0)+1 n FROM print_job_item WHERE print_job_id=?",
+                (basket_id,)).fetchone()["n"]
+            conn.execute(
+                "INSERT INTO print_job_item (print_job_id, question_id, display_order) VALUES (?,?,?)",
+                (basket_id, question_id, order))
+            conn.execute("UPDATE print_job SET updated_at=? WHERE print_job_id=?",
+                         (_now(), basket_id))
+            conn.commit()
+            return True, "已加入打印篮"
+        finally:
+            conn.close()
+
+
+def basket_remove(question_id: str, db_path: str | None = None) -> bool:
+    basket_id = get_or_create_basket(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM print_job_item WHERE print_job_id=? AND question_id=?",
+                (basket_id, question_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def basket_list(db_path: str | None = None) -> list[dict]:
+    basket_id = get_or_create_basket(db_path)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT q.question_id, q.stem_tex, q.tags_json, q.difficulty, p.display_order
+               FROM print_job_item p JOIN question q ON q.question_id = p.question_id
+               WHERE p.print_job_id=? ORDER BY p.display_order""", (basket_id,)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item["tags_json"]) if item.get("tags_json") else []
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def basket_clear(db_path: str | None = None) -> None:
+    basket_id = get_or_create_basket(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            conn.execute("DELETE FROM print_job_item WHERE print_job_id=?", (basket_id,))
             conn.commit()
         finally:
             conn.close()

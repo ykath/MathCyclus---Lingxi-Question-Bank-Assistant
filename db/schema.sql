@@ -303,7 +303,7 @@ CREATE INDEX IF NOT EXISTS idx_mistake_status ON mistake_record(status);
 CREATE TABLE IF NOT EXISTS practice_record (
     practice_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     question_id   TEXT NOT NULL REFERENCES question(question_id) ON DELETE CASCADE,
-    mistake_id    INTEGER REFERENCES mistake_record(mistake_id),
+    mistake_id    INTEGER REFERENCES mistake_record(mistake_id) ON DELETE SET NULL,
     print_job_id  INTEGER,                           -- 关联打印任务（逻辑外键，见 print_job）
     practiced_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
     result        TEXT NOT NULL CHECK (result IN ('correct','wrong')),
