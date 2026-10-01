@@ -1119,3 +1119,34 @@ def basket_move(question_id: str, direction: int, db_path: str | None = None) ->
             conn.commit()
         finally:
             conn.close()
+
+
+# ------------------------------------------------------------
+# 复习建议（M4-T01）：到期错题推荐
+# ------------------------------------------------------------
+
+def suggest_review_mistakes(days: int = 3, limit: int = 10,
+                            db_path: str | None = None) -> list[dict]:
+    """建议今天重练的错题：待重练 且（从未练过 或 距上次练习 ≥ days 天）。
+    按最久未练优先。"""
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT m.*, q.stem_tex, q.tags_json, q.difficulty
+               FROM mistake_record m JOIN question q ON q.question_id = m.question_id
+               WHERE m.status='pending'
+                 AND (m.last_practiced_at IS NULL
+                      OR date(m.last_practiced_at) <= date('now','localtime', ?))
+               ORDER BY m.last_practiced_at IS NOT NULL,
+                        m.last_practiced_at ASC, m.wrong_date ASC
+               LIMIT ?""",
+            (f"-{int(days)} days", limit)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item["tags_json"]) if item.get("tags_json") else []
+            items.append(item)
+        return items
+    finally:
+        conn.close()

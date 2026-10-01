@@ -41,25 +41,40 @@ def render() -> None:
             st.session_state["nav_page"] = "设置"
             st.rerun()
 
-    # 待办：待重练错题速览
-    pending_mistakes = db.list_mistakes("pending")
-    if pending_mistakes:
+    # 复习建议（M4-T01）：到期该重练的错题
+    due = db.suggest_review_mistakes(days=3, limit=8)
+    if due:
         st.divider()
-        st.subheader(f"📕 待重练错题（{len(pending_mistakes)}）")
-        for item in pending_mistakes[:5]:
-            cols = st.columns([4, 1])
+        st.subheader(f"📅 今天建议重练（{len(due)} 道）")
+        st.caption("规则：待重练且距今 3 天以上没练过的错题，最久未练的排前面。")
+        for item in due:
+            cols = st.columns([4, 1, 1])
             with cols[0]:
+                last = item.get("last_practiced_at") or "从未重练"
                 st.caption(f"**{item['question_id']}** · {item.get('wrong_reason') or '未标错因'} · "
-                           f"{item.get('wrong_date', '')} · "
-                           + "、".join(item.get("tags", [])))
+                           f"上次：{last[:10]} · " + "、".join(item.get("tags", [])))
             with cols[1]:
-                if st.button("去重练", key=f"home_m_{item['question_id']}",
+                if st.button("去重练", key=f"home_due_{item['question_id']}",
                              use_container_width=True):
                     st.session_state["nav_page"] = "错题本"
                     st.session_state["mistake_detail_qid"] = item["question_id"]
                     st.rerun()
-        if len(pending_mistakes) > 5:
-            st.caption(f"… 还有 {len(pending_mistakes) - 5} 道，到「错题本」查看全部")
+            with cols[2]:
+                if st.button("🧺 入篮", key=f"home_due_basket_{item['question_id']}",
+                             use_container_width=True):
+                    ok, msg = db.basket_add(item["question_id"])
+                    (st.toast if ok else st.warning)(msg)
+        if st.button("🧺 全部加入打印篮", use_container_width=True):
+            added = sum(1 for it in due if db.basket_add(it["question_id"])[0])
+            st.toast(f"已加入 {added} 道，其余已在篮中")
+
+    # 备份提醒（M4-T02）：超过 7 天未备份时提示
+    from services import backup_service
+    days = backup_service.days_since_last_backup()
+    if stats["question_count"] > 0 and (days is None or days >= 7):
+        st.divider()
+        hint = "还没有备份过题库数据" if days is None else f"距离上次备份已经 {days} 天"
+        st.info(f"💾 {hint}。建议到「设置 → 数据备份」一键备份，防止数据丢失。")
 
     # 待办：草稿提醒
     if stats["draft_pending"]:

@@ -12,6 +12,7 @@ from services import database_service as db
 from services.config_service import ai_is_configured
 from services.knowledge_service import get_knowledge_points
 from services.ocr_service import ocr_question_images, parse_ocr_output
+from services import pdf_import_service
 from app.components.question_render import render_question
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -375,8 +376,100 @@ def _render_draft_box() -> None:
 
 def render() -> None:
     st.title("📸 录入中心")
-    tab_upload, tab_drafts = st.tabs(["拍题录入", "草稿箱"])
+    tab_upload, tab_pdf, tab_drafts = st.tabs(["拍题录入", "PDF 导入", "草稿箱"])
     with tab_upload:
         _render_upload()
+    with tab_pdf:
+        _render_pdf_import()
     with tab_drafts:
         _render_draft_box()
+
+
+# ------------------------------------------------------------
+# PDF 整卷导入（M4-T04）：切页 → OCR → 草稿箱
+# ------------------------------------------------------------
+
+def _render_pdf_import() -> None:
+    st.subheader("📄 PDF 导入")
+    st.caption("导入整卷试卷或练习册 PDF：系统逐页识别并自动按题切分，结果进草稿箱，确认后入库。")
+
+    if not ai_is_configured():
+        st.warning("AI 识别服务尚未配置。请先到「设置」页填写 API Key。", icon="🤖")
+        return
+
+    pdf_file = st.file_uploader("上传 PDF 文件", type=["pdf"], key="pdf_uploader")
+    if not pdf_file:
+        return
+
+    pdf_bytes = pdf_file.getvalue()
+    page_count, err = pdf_import_service.get_pdf_page_count(pdf_bytes)
+    if err:
+        st.error(err)
+        return
+    st.caption(f"共 {page_count} 页")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        page_range = st.text_input("页码范围（如 1-5,8；留空为全部）", key="pdf_pages")
+    with col2:
+        mode = st.radio("导入为", list(ENTRY_MODES.keys()),
+                        format_func=lambda m: ENTRY_MODES[m],
+                        horizontal=True, key="pdf_mode")
+
+    pages, err = pdf_import_service.parse_page_range(page_range, page_count)
+    if err:
+        st.error(err)
+        return
+    st.caption(f"将解析 {len(pages)} 页：第 {pages[0]}–{pages[-1]} 页"
+               if len(pages) > 1 else f"将解析第 {pages[0]} 页")
+
+    if st.button(f"🤖 开始解析（{len(pages)} 页）", type="primary", use_container_width=True):
+        _run_pdf_import(pdf_bytes, pages, mode, pdf_file.name)
+
+
+def _run_pdf_import(pdf_bytes: bytes, pages: list[int], mode: str, file_name: str) -> None:
+    batch_id = db.create_import_batch(
+        "pdf", source_path=file_name, summary=f"PDF 导入 {len(pages)} 页（{ENTRY_MODES[mode]}）")
+    progress = st.progress(0.0, text="准备解析…")
+    total_drafts, errors = 0, []
+
+    for i, num in enumerate(pages):
+        progress.progress(i / len(pages), text=f"正在识别第 {num} 页（{i + 1}/{len(pages)}）")
+        images, err = pdf_import_service.render_pdf_pages(pdf_bytes, [num])
+        if err:
+            errors.append(f"第 {num} 页：{err}")
+            db.add_report_item(batch_id, "error", source_file=f"{file_name}#p{num}", reason=err)
+            continue
+        _page_num, img = images[0]
+        rel_img = pdf_import_service.save_page_image(img, batch_id, num)
+
+        text, ocr_err = ocr_question_images([img])
+        if ocr_err:
+            errors.append(f"第 {num} 页：{ocr_err}")
+            db.add_report_item(batch_id, "error", source_file=f"{file_name}#p{num}", reason=ocr_err)
+            continue
+
+        drafts = parse_ocr_output(text)
+        if not drafts:
+            errors.append(f"第 {num} 页：未识别到题目")
+            db.add_report_item(batch_id, "error", source_file=f"{file_name}#p{num}",
+                               reason="未解析出题目")
+            continue
+        for d in drafts:
+            extra = d.get("extra") or {}
+            extra.update({"entry_mode": mode, "pdf_page": num})
+            d["extra"] = extra
+            if not d.get("source_label") or d["source_label"] == "拍照录入":
+                d["source_label"] = f"{file_name} 第{num}页"
+            draft_id = db.insert_draft(d, batch_id=batch_id)
+            db.add_draft_asset(draft_id, rel_img, role="source_page_crop",
+                               original_file_name=f"{file_name}#p{num}")
+            db.add_report_item(batch_id, "needs_review", source_file=f"{file_name}#p{num}")
+        total_drafts += len(drafts)
+
+    progress.progress(1.0, text="解析完成")
+    db.finish_import_batch(batch_id, f"生成草稿 {total_drafts} 份")
+    if total_drafts:
+        st.success(f"解析完成，共生成 {total_drafts} 份草稿，请到「草稿箱」逐题确认。")
+    for e in errors:
+        st.warning(e)

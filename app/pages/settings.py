@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""设置页（M1-T02/T03）：AI 服务配置、知识点树管理、高级维护。"""
+"""设置页（M1-T02/T03 + M4-T02/T03）：AI 服务配置、知识点树管理、数据备份、高级维护。"""
+import os
+
 import streamlit as st
 
 from services.config_service import load_config, save_config, mask_api_key
@@ -83,6 +85,49 @@ def _render_advanced() -> None:
         st.rerun()
 
 
+def _render_backup() -> None:
+    """M4-T02/T03：一键备份与恢复。"""
+    st.subheader("💾 数据备份与恢复")
+    from services import backup_service
+
+    if st.button("📦 立即备份", type="primary"):
+        with st.spinner("正在打包数据库与图片…"):
+            path = backup_service.create_backup(note="手动备份")
+        st.success(f"备份完成：{os.path.basename(path)}")
+        st.rerun()
+
+    backups = backup_service.list_backups()
+    if backups:
+        st.caption("历史备份（新→旧）：")
+        for b in backups[:5]:
+            cols = st.columns([4, 2])
+            with cols[0]:
+                st.caption(f"{b['name']} · {b['size_mb']} MB · {b.get('created_at', '')}")
+            with cols[1]:
+                with open(b["path"], "rb") as f:
+                    st.download_button("⬇️ 下载", f.read(), file_name=b["name"],
+                                       mime="application/zip",
+                                       key=f"dl_{b['name']}", use_container_width=True)
+    else:
+        st.caption("还没有备份。")
+
+    st.markdown("**从备份恢复**（换电脑时使用）")
+    uploaded = st.file_uploader("选择备份 zip 文件", type=["zip"], key="restore_uploader")
+    if uploaded is not None:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp.write(uploaded.getvalue())
+            tmp_path = tmp.name
+        ok, err = backup_service.validate_backup(tmp_path)
+        if not ok:
+            st.error(err)
+        else:
+            st.warning("恢复会覆盖当前题库数据（当前数据会先自动备份一次）。确认无误后再继续。")
+            if st.button("⚠️ 确认恢复", type="secondary"):
+                ok2, msg = backup_service.restore_backup(tmp_path)
+                (st.success if ok2 else st.error)(msg)
+
+
 def render() -> None:
     st.title("⚙️ 设置")
     _render_ai_settings()
@@ -90,5 +135,7 @@ def render() -> None:
     _render_child_settings()
     st.divider()
     _render_knowledge_points()
+    st.divider()
+    _render_backup()
     st.divider()
     _render_advanced()
