@@ -29,7 +29,9 @@ PAGE_ICONS = {"首页": "🏠", "录入中心": "📸", "题库": "📚", "错�
 
 
 def goto(page: str) -> None:
-    st.session_state["nav_page"] = page
+    """跳转到指定页面（pending 模式：下一轮渲染导航组件前再生效）。"""
+    st.session_state["_nav_goto"] = page
+    st.rerun()
 
 
 def main() -> None:
@@ -49,6 +51,10 @@ def main() -> None:
 
         if "nav_page" not in st.session_state:
             st.session_state["nav_page"] = "首页"
+        # 页面内按钮请求的跳转：在导航组件实例化之前生效
+        pending = st.session_state.pop("_nav_goto", None)
+        if pending in PAGES:
+            st.session_state["nav_page"] = pending
         page = st.radio(
             "导航", PAGES,
             format_func=lambda p: f"{PAGE_ICONS[p]} {p}",

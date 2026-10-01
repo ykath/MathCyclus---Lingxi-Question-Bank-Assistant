@@ -59,7 +59,7 @@ def _render_upload() -> None:
     cols = st.columns(min(len(uploaded), 5))
     for i, file in enumerate(uploaded):
         with cols[i % 5]:
-            st.image(file.getvalue(), caption=file.name, use_container_width=True)
+            st.image(file.getvalue(), caption=file.name, use_column_width=True)
 
     if st.button(f"🤖 开始识别（{len(uploaded)} 张）", type="primary", use_container_width=True):
         _run_ocr(uploaded, mode)
@@ -322,7 +322,7 @@ def _render_draft_card(draft: dict) -> None:
             assets = draft.get("assets") or []
             if assets and os.path.exists(os.path.join(BASE_DIR, assets[0]["file_path"])):
                 st.image(os.path.join(BASE_DIR, assets[0]["file_path"]),
-                         caption="原始照片", use_container_width=True)
+                         caption="原始照片", use_column_width=True)
             else:
                 st.caption("（无原始图片）")
         with col_preview:

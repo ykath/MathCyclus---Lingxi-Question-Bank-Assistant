@@ -94,7 +94,7 @@ def _render_detail(qid: str) -> None:
         if photo_assets:
             path = os.path.join(BASE_DIR, photo_assets[0]["file_path"])
             if os.path.exists(path):
-                st.image(path, caption="孩子原始笔迹", use_container_width=True)
+                st.image(path, caption="孩子原始笔迹", use_column_width=True)
 
     # 快速批改
     st.markdown("**本次重练结果**")
@@ -217,7 +217,7 @@ def render() -> None:
         elif db.get_home_stats()["mistake_pending"] == 0 and tab == "pending":
             st.success("孩子没有错题为待重练，真棒 🎉")
             if st.button("📕 去扫描错题"):
-                st.session_state["nav_page"] = "录入中心"
+                st.session_state["_nav_goto"] = "录入中心"
                 st.session_state["entry_mode"] = "mistake"
                 st.rerun()
         else:

@@ -23,22 +23,22 @@ def render() -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("📸 拍题录入", use_container_width=True, type="primary"):
-            st.session_state["nav_page"] = "录入中心"
+            st.session_state["_nav_goto"] = "录入中心"
             st.rerun()
     with c2:
         if st.button("📕 扫描错题", use_container_width=True):
-            st.session_state["nav_page"] = "录入中心"
+            st.session_state["_nav_goto"] = "录入中心"
             st.session_state["entry_mode"] = "mistake"
             st.rerun()
     with c3:
         if st.button("🖨️ 去打印", use_container_width=True):
-            st.session_state["nav_page"] = "组卷打印"
+            st.session_state["_nav_goto"] = "组卷打印"
             st.rerun()
 
     if not ai_is_configured():
         st.info("AI 识别服务尚未配置，拍照识题暂不可用。", icon="🤖")
         if st.button("去配置 AI 服务"):
-            st.session_state["nav_page"] = "设置"
+            st.session_state["_nav_goto"] = "设置"
             st.rerun()
 
     # 复习建议（M4-T01）：到期该重练的错题
@@ -56,7 +56,7 @@ def render() -> None:
             with cols[1]:
                 if st.button("去重练", key=f"home_due_{item['question_id']}",
                              use_container_width=True):
-                    st.session_state["nav_page"] = "错题本"
+                    st.session_state["_nav_goto"] = "错题本"
                     st.session_state["mistake_detail_qid"] = item["question_id"]
                     st.rerun()
             with cols[2]:
@@ -81,7 +81,7 @@ def render() -> None:
         st.divider()
         st.warning(f"有 {stats['draft_pending']} 份 AI 识别草稿等待确认。", icon="📥")
         if st.button("去审核草稿"):
-            st.session_state["nav_page"] = "录入中心"
+            st.session_state["_nav_goto"] = "录入中心"
             st.rerun()
 
     # 空状态引导
