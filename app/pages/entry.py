@@ -351,6 +351,16 @@ def _render_draft_card(draft: dict) -> None:
                 st.rerun()
 
 
+def _commit_drafts_batch(drafts: list[dict]) -> None:
+    """批量通过入库一组草稿，并提示结果。"""
+    ok, fail = 0, 0
+    for d in drafts:
+        _qid, err = db.commit_draft(d["draft_id"])
+        ok, fail = ok + (not err), fail + bool(err)
+    st.success(f"批量入库完成：成功 {ok} 份" + (f"，失败 {fail} 份" if fail else ""))
+    st.rerun()
+
+
 def _render_draft_box() -> None:
     st.subheader("📥 草稿箱")
     drafts = db.list_drafts(["needs_review", "ready"])
@@ -362,16 +372,40 @@ def _render_draft_box() -> None:
     if ready_drafts:
         if st.button(f"⚡ 全部通过入库（{len(ready_drafts)} 份已改好的草稿）",
                      use_container_width=True):
-            ok, fail = 0, 0
-            for d in ready_drafts:
-                _qid, err = db.commit_draft(d["draft_id"])
-                ok, fail = ok + (not err), fail + bool(err)
-            st.success(f"批量入库完成：成功 {ok} 份" + (f"，失败 {fail} 份" if fail else ""))
-            st.rerun()
+            _commit_drafts_batch(ready_drafts)
 
     st.caption(f"共 {len(drafts)} 份待确认（🟡 需要检查 / 🟢 已改好）")
-    for draft in drafts:
-        _render_draft_card(draft)
+
+    # 按来源页分组：PDF 导入的草稿用「文件名 第N页」整页分组；
+    # 其余（拍照等）按出处标签分组。支持整页批量确认。
+    groups: dict[str, list[dict]] = {}
+    page_order: dict[str, tuple[int, str]] = {}
+    for d in drafts:
+        extra = _get_draft_extra(d)
+        if extra.get("pdf_source") and extra.get("pdf_page") is not None:
+            label = f"{extra['pdf_source']} 第{extra['pdf_page']}页"
+            order_key = (int(extra["pdf_page"]), label)
+        else:
+            label = d.get("source_label") or f"草稿 #{d['draft_id']}"
+            order_key = (10 ** 9, label)
+        groups.setdefault(label, []).append(d)
+        page_order.setdefault(label, order_key)
+
+    for gi, label in enumerate(sorted(groups, key=lambda lb: page_order[lb])):
+        items = groups[label]
+        n_ready = sum(1 for d in items if d["review_status"] == "ready")
+        n_check = len(items) - n_ready
+        col_label, col_btn = st.columns([3, 1])
+        with col_label:
+            st.markdown(f"📄 **{label}** · {len(items)} 份"
+                        + (f"（🟢 {n_ready} / 🟡 {n_check}）" if n_check else ""))
+        with col_btn:
+            if st.button("✅ 本页全部通过", key=f"page_commit_{gi}",
+                         use_container_width=True,
+                         help="该页所有草稿直接入库；含待检查的草稿时请谨慎"):
+                _commit_drafts_batch(items)
+        for draft in items:
+            _render_draft_card(draft)
 
 
 def render() -> None:
@@ -457,7 +491,7 @@ def _run_pdf_import(pdf_bytes: bytes, pages: list[int], mode: str, file_name: st
             continue
         for d in drafts:
             extra = d.get("extra") or {}
-            extra.update({"entry_mode": mode, "pdf_page": num})
+            extra.update({"entry_mode": mode, "pdf_page": num, "pdf_source": file_name})
             d["extra"] = extra
             if not d.get("source_label") or d["source_label"] == "拍照录入":
                 d["source_label"] = f"{file_name} 第{num}页"
@@ -470,6 +504,7 @@ def _run_pdf_import(pdf_bytes: bytes, pages: list[int], mode: str, file_name: st
     progress.progress(1.0, text="解析完成")
     db.finish_import_batch(batch_id, f"生成草稿 {total_drafts} 份")
     if total_drafts:
-        st.success(f"解析完成，共生成 {total_drafts} 份草稿，请到「草稿箱」逐题确认。")
+        st.success(f"解析完成，共生成 {total_drafts} 份草稿。请到「草稿箱」逐题确认，"
+                   "或用每页右上角的「本页全部通过」整页入库。")
     for e in errors:
         st.warning(e)
