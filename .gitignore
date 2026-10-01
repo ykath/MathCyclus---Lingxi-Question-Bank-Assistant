@@ -1,39 +1,30 @@
-# API 密钥和环境变量 (绝对不能上传)
+# ============================================================
+# MathCyclus .gitignore（UTF-8）
+# 原则：源码、schema、脚本、模板、文档进 Git；
+#       密钥、题库私有数据、本地数据库、导出产物、缓存不进 Git。
+# ============================================================
+
+# ---------- 密钥与配置（绝对不能上传） ----------
 .env
 .env.*
 !.env.example
-
-# Agent Mail 授权过程中的本地临时日志
+env.local
+.streamlit/secrets.toml
 .agently-auth/
 
-# Streamlit 本地密钥
-.streamlit/secrets.toml
-
-# TikZ 绘图的临时图片和 PDF 缓存 (会占用大量空间，不需要上传)
-.tikz_cache/
-*.pdf
-
-
-# Python 缓存文件
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-
-# 操作系统生成的无用文件
-.DS_Store
-Thumbs.db
-log.csv
-
-# 本机运行日志、提示词备份和可重建索引
-更新信息.txt
-ocr的备份.txt
-debug.log
-log.csv
+# ---------- 题库私有数据（版权与体积风险，仅存本地） ----------
+# 题库 LaTeX 源文件与题图，本地保留，不入库
+chapters/
+# 用户生成的组卷导出文件（主题模板仍入库）
+Test Paper Group/导出文件/
+exports/
+# 本地数据库、图片资源、导入中间产物、备份
+data/
+assets/questions/
+backups/
+reports/
+.backups/
+# 题库本地索引与统计（每台电脑独立生成，可重建）
 utils/题库索引表.csv
 utils/semantic_index.sqlite3
 utils/local_stats.sqlite3
@@ -41,16 +32,21 @@ utils/local_stats.sqlite3-*
 utils/operation_log.sqlite3
 utils/operation_log.sqlite3-*
 
-# 本机工作区和临时同步目录
+# ---------- 运行日志与临时产物 ----------
+log.csv
+debug.log
+更新信息.txt
+ocr的备份.txt
 .sync-work-*/
 .codex/
+.agents/
+tatus --short
+test_ocr_question.png
 
-# 外部大型参考项目 (避免索引崩溃与上传超时)
-SolaireEPDA-master/
-
-# LaTeX 编译输出
+# ---------- 编译与渲染缓存 ----------
+.tikz_cache/
+*.pdf
 *.synctex.gz
-*.log
 *.aux
 *.out
 *.toc
@@ -59,48 +55,38 @@ SolaireEPDA-master/
 *.fls
 *.fdb_latexmk
 *.xdv
+*.log
 
-# 历史备份文件（非正式代码）
-question_bank_app000.py
-old_app.py
-
-# 与项目无关的文档
-高中数学建模15课时课程设计.md
-
-# 虚拟环境
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .venv/
 
-# Python 编译缓存
-*.pyc
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
 
+# ---------- 历史备份与外部参考 ----------
+question_bank_app000.py
+old_app.py
+SolaireEPDA-master/
+高中数学建模15课时课程设计.md
 MathCyclus_demo.html
-cloze_exports/
-Test Paper Group/
-Test Paper Group/导出文件/
 AutoTikz.md
+cloze_exports/
 
-# 题库试题源文件默认不上传 GitHub，避免版权与仓库体积风险
-*-G-*.tex
-*-M-*.tex
-*-W-*.tex
-*-XK-*.tex
-*-XS-*.tex
-*-QJ-*.tex
-*-JS-*.tex
-*-WK-*.tex
-
-# 管理备份问题：本地自动备份，不上传到 GitHub
-.backups/
-
-# 独立的前端实验工作区，不属于当前 Streamlit 应用
+# ---------- 独立前端实验工作区 ----------
 tiku/
 
-# Local UI verification artifacts
+# ---------- 本地 UI 验证产物 ----------
 .edge-test-profile/
 .ui-check.png
 .dom-check.html
 .streamlit-test.log
-
-# One-off local maintenance scripts
 fix_codex_config.py
-
