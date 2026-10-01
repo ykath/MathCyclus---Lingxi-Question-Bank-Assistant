@@ -73,12 +73,16 @@ def _render_card(item: dict) -> None:
             card_choices = []
         render_question(item.get("stem_tex", ""), card_choices, show_answer=False)
 
-        btn_cols = st.columns([1, 1, 4])
+        btn_cols = st.columns([1, 1, 1, 3])
         with btn_cols[0]:
             if st.button("查看 / 编辑", key=f"bank_open_{qid}", use_container_width=True):
                 st.session_state["bank_detail_qid"] = qid
                 st.rerun()
         with btn_cols[1]:
+            if st.button("🧺 加入打印篮", key=f"bank_basket_{qid}", use_container_width=True):
+                ok, msg = db.basket_add(qid)
+                (st.toast if ok else st.warning)(msg)
+        with btn_cols[2]:
             has_answer = bool((item.get("answer_tex") or "").strip())
             if has_answer:
                 with st.popover("看答案", use_container_width=True):

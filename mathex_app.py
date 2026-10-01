@@ -57,8 +57,10 @@ def main() -> None:
         )
 
         stats = db.get_home_stats()
+        basket_count = len(db.basket_list())
         st.divider()
-        st.caption(f"题库 {stats['question_count']} 题 · 待审核草稿 {stats['draft_pending']} 份")
+        st.caption(f"题库 {stats['question_count']} 题 · 待审核草稿 {stats['draft_pending']} 份 · "
+                   f"打印篮 {basket_count} 题")
         if stats["draft_pending"]:
             st.warning(f"📥 有 {stats['draft_pending']} 份识别草稿待确认", icon="📥")
 

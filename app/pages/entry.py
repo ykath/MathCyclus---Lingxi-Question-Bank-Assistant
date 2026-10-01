@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
-"""录入中心（M1-T05~T10）：拍题三步走（拍 → 看 → 存）+ 草稿箱。"""
+"""录入中心（M1-T05~T10 + M2-T01/T02）：拍题三步走（拍 → 看 → 存）+ 扫错题 + 草稿箱。"""
+import json
 import os
+import shutil
+from datetime import date
 
 import streamlit as st
 from PIL import Image
@@ -8,13 +11,16 @@ from PIL import Image
 from services import database_service as db
 from services.config_service import ai_is_configured
 from services.knowledge_service import get_knowledge_points
-from services.ocr_service import ocr_question_images
-from app.components.question_render import assemble_tex, render_question
+from services.ocr_service import ocr_question_images, parse_ocr_output
+from app.components.question_render import render_question
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IMPORTS_DIR = os.path.join(BASE_DIR, "data", "imports")
+QUESTION_ASSETS_DIR = os.path.join(BASE_DIR, "assets", "questions")
 
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "bmp"]
+
+ENTRY_MODES = {"normal": "📸 普通拍题", "mistake": "📕 扫错题"}
 
 
 # ------------------------------------------------------------
@@ -23,7 +29,18 @@ IMAGE_TYPES = ["png", "jpg", "jpeg", "webp", "bmp"]
 
 def _render_upload() -> None:
     st.subheader("📸 拍题录入")
-    st.caption("支持拍照图片、截图，可一次多张；也可以直接把剪贴板里的截图粘贴到上传框。")
+
+    default_mode = st.session_state.pop("entry_mode", "normal")
+    mode = st.radio(
+        "录入类型", list(ENTRY_MODES.keys()),
+        format_func=lambda m: ENTRY_MODES[m],
+        index=0 if default_mode == "normal" else 1,
+        horizontal=True, key="entry_mode_radio",
+    )
+    if mode == "mistake":
+        st.caption("拍孩子做错的题（可以带着笔迹），识别后补充错因和出处，进入错题本。")
+    else:
+        st.caption("拍教辅书/试卷上的好题，支持多图批量；也可以直接把剪贴板截图粘贴到上传框。")
 
     if not ai_is_configured():
         st.warning("AI 识别服务尚未配置。请先到「设置」页填写 API Key。", icon="🤖")
@@ -33,24 +50,24 @@ def _render_upload() -> None:
         "上传题目照片（可多选 / 拖拽 / 粘贴）",
         type=IMAGE_TYPES,
         accept_multiple_files=True,
-        key="entry_uploader",
+        key=f"entry_uploader_{mode}",
     )
     if not uploaded:
         return
 
-    # 缩略图预览
     cols = st.columns(min(len(uploaded), 5))
     for i, file in enumerate(uploaded):
         with cols[i % 5]:
             st.image(file.getvalue(), caption=file.name, use_container_width=True)
 
     if st.button(f"🤖 开始识别（{len(uploaded)} 张）", type="primary", use_container_width=True):
-        _run_ocr(uploaded)
+        _run_ocr(uploaded, mode)
 
 
-def _run_ocr(uploaded) -> None:
+def _run_ocr(uploaded, mode: str) -> None:
     """逐张识别 → 解析 → 写入草稿箱。"""
-    batch_id = db.create_import_batch("ocr", summary=f"拍题录入 {len(uploaded)} 张图片")
+    batch_label = "扫错题" if mode == "mistake" else "拍题录入"
+    batch_id = db.create_import_batch("ocr", summary=f"{batch_label} {len(uploaded)} 张图片")
     batch_dir = os.path.join(IMPORTS_DIR, f"batch_{batch_id}")
     os.makedirs(batch_dir, exist_ok=True)
 
@@ -66,7 +83,7 @@ def _run_ocr(uploaded) -> None:
             errors.append(f"{file.name}：图片无法打开（{e}）")
             continue
 
-        # 保存原图作为草稿附件（可回溯对照）
+        # 保存原图作为草稿附件（可回溯对照；错题模式下入库后转存为孩子笔迹原图）
         img_path = os.path.join(batch_dir, f"img_{i + 1}.jpg")
         img.convert("RGB").save(img_path, format="JPEG", quality=90)
         rel_img_path = os.path.relpath(img_path, BASE_DIR)
@@ -77,42 +94,52 @@ def _run_ocr(uploaded) -> None:
             db.add_report_item(batch_id, "error", source_file=file.name, reason=err)
             continue
 
-        drafts = db_parse_and_store(text, batch_id, rel_img_path, file.name)
-        if drafts == 0:
+        count = _parse_and_store(text, batch_id, rel_img_path, file.name, mode)
+        if count == 0:
             errors.append(f"{file.name}：AI 返回的内容中没有识别到题目")
             db.add_report_item(batch_id, "error", source_file=file.name, reason="未解析出题目")
-        total_drafts += drafts
+        total_drafts += count
 
     progress.progress(1.0, text="识别完成")
     db.finish_import_batch(batch_id, f"生成草稿 {total_drafts} 份")
 
     if total_drafts:
-        st.success(f"识别完成，共生成 {total_drafts} 份草稿，请在下方「草稿箱」逐题确认。")
+        st.success(f"识别完成，共生成 {total_drafts} 份草稿，请到「草稿箱」逐题确认。")
     for e in errors:
         st.error(e)
     if errors and not total_drafts:
         st.info("如果照片不清晰，可以重新拍摄后再试；也可以在草稿箱中手工修正。")
 
 
-def db_parse_and_store(text: str, batch_id: int, img_rel_path: str, file_name: str) -> int:
-    from services.ocr_service import parse_ocr_output
+def _parse_and_store(text: str, batch_id: int, img_rel_path: str,
+                     file_name: str, mode: str) -> int:
     drafts = parse_ocr_output(text)
     for d in drafts:
+        extra = d.get("extra") or {}
+        extra["entry_mode"] = mode
+        d["extra"] = extra
         draft_id = db.insert_draft(d, batch_id=batch_id)
         db.add_draft_asset(draft_id, img_rel_path, role="source_page_crop",
                            original_file_name=file_name)
-        db.add_report_item(batch_id, "needs_review", source_file=file_name)
+        db.add_report_item(batch_id, "needs_review", source_file=file.name)
     return len(drafts)
 
 
 # ------------------------------------------------------------
-# 第二、三步「看 → 存」：草稿箱审核
+# 草稿编辑表单（M1-T05 精简字段 + M2-T01 错题专属字段）
 # ------------------------------------------------------------
 
+def _get_draft_extra(draft: dict) -> dict:
+    try:
+        return json.loads(draft.get("extra_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
 def _draft_edit_form(draft: dict) -> None:
-    """草稿编辑表单（M1-T05 精简字段模型）。"""
     did = draft["draft_id"]
     knowledge_points = get_knowledge_points()
+    extra = _get_draft_extra(draft)
 
     stem = st.text_area("题目", value=draft.get("stem_tex") or "", height=120,
                         key=f"draft_stem_{did}")
@@ -145,27 +172,102 @@ def _draft_edit_form(draft: dict) -> None:
     note = st.text_input("来源 / 备注", value=draft.get("note") or "",
                          key=f"draft_note_{did}", placeholder="如：2025 期末卷 第12题")
 
+    # 错题模式专属字段（M2-T01）
+    mistake_fields = {}
+    if extra.get("entry_mode") == "mistake":
+        st.markdown("**📕 错题信息**")
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            reason = st.selectbox(
+                "错因", db.WRONG_REASONS,
+                index=db.WRONG_REASONS.index(extra.get("wrong_reason", "计算失误"))
+                if extra.get("wrong_reason") in db.WRONG_REASONS else 0,
+                key=f"draft_reason_{did}")
+            wrong_date = st.date_input("出错日期", value=date.today(), key=f"draft_wdate_{did}")
+        with mcol2:
+            source_text = st.text_input("出处", value=extra.get("mistake_source", ""),
+                                        key=f"draft_msource_{did}",
+                                        placeholder="如：2026 秋 期中考试")
+            threshold = st.number_input("做对几次后移出错题本", min_value=1, max_value=5,
+                                        value=int(extra.get("pass_threshold", 2)),
+                                        key=f"draft_threshold_{did}")
+        mistake_fields = {
+            "wrong_reason": reason,
+            "wrong_date": wrong_date.strftime("%Y-%m-%d"),
+            "mistake_source": source_text,
+            "pass_threshold": threshold,
+        }
+
     if st.button("💾 保存修改", key=f"draft_save_{did}", use_container_width=True):
         _save_draft_form(did, stem, choices_text, answer, solution,
-                         difficulty, qtype, tags, new_tags, note)
+                         difficulty, qtype, tags, new_tags, note, extra, mistake_fields)
         st.success("已保存")
         st.rerun()
 
 
 def _save_draft_form(did, stem, choices_text, answer, solution,
-                     difficulty, qtype, tags, new_tags, note) -> None:
+                     difficulty, qtype, tags, new_tags, note, extra, mistake_fields) -> None:
     choices = [c.strip() for c in choices_text.split("\n") if c.strip()]
     extra_tags = [t.strip() for t in new_tags.replace("，", ",").split(",") if t.strip()]
     all_tags = list(dict.fromkeys(list(tags) + extra_tags))
+    extra.update(mistake_fields)
     db.update_draft(did, {
         "stem_tex": stem, "choices": choices, "answer_tex": answer,
         "solution_tex": solution, "difficulty": difficulty,
-        "question_type": qtype, "tags": all_tags, "note": note,
+        "question_type": qtype, "tags": all_tags, "note": note, "extra": extra,
     })
 
 
+# ------------------------------------------------------------
+# 入库（M1-T09/T10 重复检测 + M2-T02 错题照片转存）
+# ------------------------------------------------------------
+
+def _attach_mistake_photo(draft: dict, qid: str) -> int | None:
+    """错题入库时把原始照片转存为题目附件（保留孩子笔迹），返回 asset_id。"""
+    assets = draft.get("assets") or []
+    if not assets:
+        return None
+    src = os.path.join(BASE_DIR, assets[0]["file_path"])
+    if not os.path.exists(src):
+        return None
+    dest_dir = os.path.join(QUESTION_ASSETS_DIR, qid)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "source-1.jpg")
+    shutil.copy2(src, dest)
+    return db.add_question_asset(qid, os.path.relpath(dest, BASE_DIR), role="source",
+                                 original_file_name=assets[0].get("original_file_name", ""))
+
+
+def _do_commit(draft: dict) -> None:
+    did = draft["draft_id"]
+    qid, err = db.commit_draft(did)
+    if err:
+        st.error(f"入库失败：{err}")
+        return
+
+    extra = _get_draft_extra(draft)
+    if extra.get("entry_mode") == "mistake":
+        photo_asset_id = _attach_mistake_photo(draft, qid)
+        _mid, m_err = db.add_mistake(
+            qid,
+            wrong_reason=extra.get("wrong_reason", "其他"),
+            wrong_date=extra.get("wrong_date"),
+            source_text=extra.get("mistake_source", ""),
+            original_photo_asset_id=photo_asset_id,
+            pass_threshold=int(extra.get("pass_threshold", 2)),
+        )
+        if m_err:
+            st.warning(f"题目已入库（{qid}），但加入错题本失败：{m_err}")
+        else:
+            st.success(f"已入库 {qid}，并加入错题本（待重练）📕")
+            st.rerun()
+            return
+    else:
+        st.success(f"已入库，题目编号 {qid}")
+    st.rerun()
+
+
 def _commit_draft_with_duplicate_check(draft: dict) -> None:
-    """M1-T09/T10：入库前重复检测，确认后写正式库。"""
     did = draft["draft_id"]
     confirm_key = f"dup_confirmed_{did}"
 
@@ -188,30 +290,29 @@ def _commit_draft_with_duplicate_check(draft: dict) -> None:
                     st.rerun()
             return
 
-    qid, err = db.commit_draft(did)
     st.session_state.pop(confirm_key, None)
-    if err:
-        st.error(f"入库失败：{err}")
-    else:
-        st.success(f"已入库，题目编号 {qid}")
-        st.rerun()
+    _do_commit(draft)
 
 
 def _render_draft_card(draft: dict) -> None:
     did = draft["draft_id"]
     warnings = []
     if draft.get("validation_json"):
-        import json
         try:
             warnings = json.loads(draft["validation_json"]).get("warnings", [])
         except (json.JSONDecodeError, AttributeError):
             pass
 
+    extra = _get_draft_extra(draft)
+    is_mistake = extra.get("entry_mode") == "mistake"
     status_icon = {"needs_review": "🟡", "ready": "🟢"}.get(draft["review_status"], "⚪")
     label = draft.get("source_label") or f"草稿 #{did}"
 
     with st.container(border=True):
-        st.markdown(f"**{status_icon} {label}**　`{draft.get('question_type') or '未定题型'}`")
+        title = f"**{status_icon} {label}**　`{draft.get('question_type') or '未定题型'}`"
+        if is_mistake:
+            title += "　📕 错题"
+        st.markdown(title)
         if warnings:
             st.caption("⚠️ " + "；".join(warnings))
 
@@ -229,12 +330,13 @@ def _render_draft_card(draft: dict) -> None:
                             draft.get("answer_tex", ""), draft.get("solution_tex", ""),
                             show_answer=True)
 
-        with st.expander("✏️ 修改内容", expanded=bool(warnings)):
+        with st.expander("✏️ 修改内容", expanded=bool(warnings) or is_mistake):
             _draft_edit_form(draft)
 
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            if st.button("✅ 通过入库", key=f"draft_commit_{did}",
+            commit_label = "✅ 通过入库（进错题本）" if is_mistake else "✅ 通过入库"
+            if st.button(commit_label, key=f"draft_commit_{did}",
                          type="primary", use_container_width=True):
                 _commit_draft_with_duplicate_check(draft)
         with col_b:
