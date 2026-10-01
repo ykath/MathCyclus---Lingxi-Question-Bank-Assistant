@@ -997,3 +997,125 @@ def basket_clear(db_path: str | None = None) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+# ------------------------------------------------------------
+# 打印任务（M3-T06/T07）
+# ------------------------------------------------------------
+
+def finalize_print_job(basket_id: int, title: str, settings: dict,
+                       pdf_path: str = "", db_path: str | None = None) -> None:
+    """打印篮生成产物后：更新标题/设置/PDF 路径，状态转 generated。"""
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            conn.execute(
+                """UPDATE print_job SET title=?, settings_json=?, pdf_path=?, status='generated',
+                   updated_at=? WHERE print_job_id=?""",
+                (title, _dump_json(settings), pdf_path, _now(), basket_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_print_jobs(status: list[str] | None = None, limit: int = 20,
+                    db_path: str | None = None) -> list[dict]:
+    """打印历史（新→旧），不含当前打印篮草稿。"""
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        where = "p.status != 'draft'"
+        params: list = []
+        if status:
+            where += f" AND p.status IN ({','.join('?' * len(status))})"
+            params.extend(status)
+        rows = conn.execute(
+            f"""SELECT p.*, (SELECT COUNT(*) FROM print_job_item i
+                             WHERE i.print_job_id=p.print_job_id) AS item_count,
+                       (SELECT COUNT(*) FROM practice_record r
+                             WHERE r.print_job_id=p.print_job_id) AS graded_count
+                FROM print_job p WHERE {where}
+                ORDER BY p.updated_at DESC LIMIT ?""",
+            (*params, limit)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["settings"] = json.loads(item["settings_json"]) if item.get("settings_json") else {}
+            except json.JSONDecodeError:
+                item["settings"] = {}
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def get_print_job_items(print_job_id: int, db_path: str | None = None) -> list[dict]:
+    ensure_initialized(db_path)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT q.question_id, q.stem_tex, q.tags_json, q.difficulty,
+                      q.answer_tex, q.solution_tex, p.display_order
+               FROM print_job_item p JOIN question q ON q.question_id = p.question_id
+               WHERE p.print_job_id=? ORDER BY p.display_order""",
+            (print_job_id,)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item["tags_json"]) if item.get("tags_json") else []
+            # 是否已批改
+            graded = conn.execute(
+                "SELECT result FROM practice_record WHERE print_job_id=? AND question_id=?",
+                (print_job_id, item["question_id"])).fetchone()
+            item["graded_result"] = graded["result"] if graded else None
+            item["in_mistakes"] = conn.execute(
+                "SELECT 1 FROM mistake_record WHERE question_id=? AND status='pending'",
+                (item["question_id"],)).fetchone() is not None
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def mark_print_job_status(print_job_id: int, status: str, db_path: str | None = None) -> None:
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            conn.execute("UPDATE print_job SET status=?, updated_at=? WHERE print_job_id=?",
+                         (status, _now(), print_job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def close_basket(basket_id: int, db_path: str | None = None) -> None:
+    """打印完成后打印篮不再显示为草稿（历史保留，可重印/批改）。"""
+    mark_print_job_status(basket_id, "printed", db_path)
+
+
+def basket_move(question_id: str, direction: int, db_path: str | None = None) -> None:
+    """打印篮内题目上移/下移（direction=-1 上移，+1 下移）。"""
+    basket_id = get_or_create_basket(db_path)
+    with _LOCK:
+        conn = get_conn(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT question_id, display_order FROM print_job_item "
+                "WHERE print_job_id=? ORDER BY display_order", (basket_id,)).fetchall()
+            ids = [r["question_id"] for r in rows]
+            if question_id not in ids:
+                return
+            idx = ids.index(question_id)
+            swap = idx + direction
+            if swap < 0 or swap >= len(ids):
+                return
+            ids[idx], ids[swap] = ids[swap], ids[idx]
+            for order, qid in enumerate(ids, 1):
+                conn.execute(
+                    "UPDATE print_job_item SET display_order=? WHERE print_job_id=? AND question_id=?",
+                    (order, basket_id, qid))
+            conn.commit()
+        finally:
+            conn.close()
